@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Reading, Unavailable};
+use crate::probes::ata_smart::{self, AtaHealth};
 use crate::win::device::{self, SafeHandle};
 use crate::win::ioctl::{as_bytes, device_io_control, read_struct, IOCTL_STORAGE_QUERY_PROPERTY};
 
@@ -125,6 +126,18 @@ pub struct NvmeHealth {
     pub terabytes_written: Reading<f64>,
 }
 
+/// Drive health, tagged by the command set it came from.
+///
+/// NVMe and ATA expose genuinely different data — NVMe has a controller-computed
+/// `percentage_used`, ATA has per-attribute sector counts — so they are kept distinct
+/// rather than flattened into a lowest-common-denominator shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "protocol", rename_all = "snake_case")]
+pub enum DriveHealth {
+    Nvme(NvmeHealth),
+    Ata(AtaHealth),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriveReport {
     pub index: u32,
@@ -133,7 +146,7 @@ pub struct DriveReport {
     pub firmware: Reading<String>,
     pub bus_type: String,
     pub removable: bool,
-    pub health: Reading<NvmeHealth>,
+    pub health: Reading<DriveHealth>,
 }
 
 /// Probe every physical drive present.
@@ -186,16 +199,17 @@ fn probe_drive(index: u32, handle: &SafeHandle) -> DriveReport {
         ),
     };
 
-    let is_nvme = descriptor.as_ref().map(|d| d.bus_type) == Some(0x11);
+    let bus = descriptor.as_ref().map(|d| d.bus_type).unwrap_or(0);
 
-    let health = if is_nvme {
-        match query_nvme_health(handle) {
-            Ok(h) => Reading::value(h),
+    let health = match bus {
+        0x11 => match query_nvme_health(handle) {
+            Ok(h) => Reading::value(DriveHealth::Nvme(h)),
             Err(e) => Reading::failed(e),
-        }
-    } else {
-        // SATA/ATA SMART needs a different path (ATA pass-through); not yet implemented.
-        Reading::missing(Unavailable::NotSupportedByHardware)
+        },
+        // SATA, ATA and ATAPI all speak the ATA SMART command set.
+        0x02 | 0x03 | 0x0B => ata_smart::probe_drive(index).map(DriveHealth::Ata),
+        // USB enclosures and RAID volumes usually do not pass either command set through.
+        _ => Reading::missing(Unavailable::NotSupportedByHardware),
     };
 
     DriveReport {

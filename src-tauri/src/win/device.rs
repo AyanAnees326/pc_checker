@@ -13,7 +13,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
-/// `GUID_DEVICE_BATTERY` from batclass.h — the battery device interface class.
+/// `GUID_DEVICE_BATTERY` from batclass.h - the battery device interface class.
 pub const GUID_DEVICE_BATTERY: GUID = GUID::from_u128(0x72631e54_78a4_11d0_bcf7_00aa00b7b32a);
 
 /// `GUID_DEVINTERFACE_DISK` from ntddstor.h.
@@ -40,7 +40,7 @@ impl Drop for SafeHandle {
 
 /// Enumerate the device-interface paths registered for `class_guid`.
 ///
-/// Returns an empty vector when the machine simply has none of that device — a desktop
+/// Returns an empty vector when the machine simply has none of that device: a desktop
 /// with no battery is a normal outcome here, not an error.
 pub fn interface_paths(class_guid: &GUID) -> WinResult<Vec<String>> {
     let mut paths = Vec::new();
@@ -52,7 +52,7 @@ pub fn interface_paths(class_guid: &GUID) -> WinResult<Vec<String>> {
             None,
             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
         )
-        .map_err(|_| WinError::last("SetupDiGetClassDevsW"))?;
+        .map_err(|e| WinError::from_win("SetupDiGetClassDevsW", &e))?;
 
         let mut index = 0u32;
         loop {
@@ -61,12 +61,14 @@ pub fn interface_paths(class_guid: &GUID) -> WinResult<Vec<String>> {
                 ..Default::default()
             };
 
-            if SetupDiEnumDeviceInterfaces(dev_info, None, class_guid, index, &mut iface).is_err() {
+            if let Err(e) =
+                SetupDiEnumDeviceInterfaces(dev_info, None, class_guid, index, &mut iface)
+            {
                 // ERROR_NO_MORE_ITEMS is the normal loop terminator.
-                let code = windows::Win32::Foundation::GetLastError().0;
-                if code != ERROR_NO_MORE_ITEMS.0 {
+                let err = WinError::from_win("SetupDiEnumDeviceInterfaces", &e);
+                if err.code != ERROR_NO_MORE_ITEMS.0 {
                     let _ = SetupDiDestroyDeviceInfoList(dev_info);
-                    return Err(WinError::new("SetupDiEnumDeviceInterfaces", code));
+                    return Err(err);
                 }
                 break;
             }
@@ -104,8 +106,8 @@ pub fn interface_paths(class_guid: &GUID) -> WinResult<Vec<String>> {
                 {
                     // DevicePath is a flexible array member declared as [u16; 1].
                     let path_ptr = std::ptr::addr_of!((*detail).DevicePath) as *const u16;
-                    let max_chars =
-                        (required as usize - std::mem::size_of::<u32>()) / std::mem::size_of::<u16>();
+                    let max_chars = (required as usize - std::mem::size_of::<u32>())
+                        / std::mem::size_of::<u16>();
                     let slice = std::slice::from_raw_parts(path_ptr, max_chars);
                     let path = wide_to_string(slice);
                     if !path.is_empty() {
@@ -136,7 +138,7 @@ pub fn open_device(path: &str) -> WinResult<SafeHandle> {
             FILE_FLAGS_AND_ATTRIBUTES(0),
             None,
         )
-        .map_err(|_| WinError::last("CreateFileW"))?;
+        .map_err(|e| WinError::from_win("CreateFileW", &e))?;
 
         if handle == INVALID_HANDLE_VALUE {
             return Err(WinError::last("CreateFileW"));
@@ -162,10 +164,38 @@ pub fn open_physical_drive(index: u32) -> WinResult<SafeHandle> {
             FILE_FLAGS_AND_ATTRIBUTES(0),
             None,
         )
-        .map_err(|_| WinError::last("CreateFileW(PhysicalDrive)"))?;
+        .map_err(|e| WinError::from_win("CreateFileW(PhysicalDrive)", &e))?;
 
         if handle == INVALID_HANDLE_VALUE {
             return Err(WinError::last("CreateFileW(PhysicalDrive)"));
+        }
+        Ok(SafeHandle(handle))
+    }
+}
+
+/// Open a physical drive with read/write access.
+///
+/// `IOCTL_ATA_PASS_THROUGH` is declared `FILE_READ_ACCESS | FILE_WRITE_ACCESS`, so the
+/// handle must carry both even though the SMART commands we issue are strictly
+/// data-in. Nothing in this crate ever sends an ATA write command; prefer
+/// [`open_physical_drive`] wherever the zero-access handle is sufficient.
+pub fn open_physical_drive_rw(index: u32) -> WinResult<SafeHandle> {
+    let path = format!(r"\\.\PhysicalDrive{index}");
+    let wide = to_wide(&path);
+    unsafe {
+        let handle = CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        )
+        .map_err(|e| WinError::from_win("CreateFileW(PhysicalDrive rw)", &e))?;
+
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(WinError::last("CreateFileW(PhysicalDrive rw)"));
         }
         Ok(SafeHandle(handle))
     }

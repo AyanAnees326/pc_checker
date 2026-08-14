@@ -4,6 +4,7 @@
 //! configuration changes, no sustained load. This is the whole of Quick Scan and the
 //! foundation of the M1 report.
 
+pub mod ata_smart;
 pub mod battery;
 pub mod battery_history;
 pub mod firmware;

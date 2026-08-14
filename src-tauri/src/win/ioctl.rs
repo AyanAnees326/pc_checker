@@ -9,6 +9,7 @@ use windows::Win32::System::IO::DeviceIoControl;
 pub const METHOD_BUFFERED: u32 = 0;
 pub const FILE_ANY_ACCESS: u32 = 0;
 pub const FILE_READ_ACCESS: u32 = 1;
+pub const FILE_WRITE_ACCESS: u32 = 2;
 
 pub const FILE_DEVICE_BATTERY: u32 = 0x0000_0029;
 pub const FILE_DEVICE_MASS_STORAGE: u32 = 0x0000_002d;
@@ -31,6 +32,34 @@ pub const IOCTL_STORAGE_QUERY_PROPERTY: u32 =
     ctl_code(FILE_DEVICE_MASS_STORAGE, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS);
 pub const IOCTL_SCSI_PASS_THROUGH: u32 =
     ctl_code(FILE_DEVICE_CONTROLLER, 0x0401, METHOD_BUFFERED, FILE_READ_ACCESS);
+
+pub const FILE_DEVICE_DISK: u32 = 0x0000_0007;
+
+/// `SMART_GET_VERSION` — probes whether the driver supports the legacy SMART IOCTLs.
+pub const SMART_GET_VERSION: u32 =
+    ctl_code(FILE_DEVICE_DISK, 0x0020, METHOD_BUFFERED, FILE_READ_ACCESS);
+
+/// `SMART_RCV_DRIVE_DATA` — the legacy SMART read path.
+///
+/// Older and narrower than ATA pass-through, but supported by AHCI drivers that
+/// reject `IOCTL_ATA_PASS_THROUGH` outright, so it is tried first.
+pub const SMART_RCV_DRIVE_DATA: u32 = ctl_code(
+    FILE_DEVICE_DISK,
+    0x0022,
+    METHOD_BUFFERED,
+    FILE_READ_ACCESS | FILE_WRITE_ACCESS,
+);
+
+/// `IOCTL_ATA_PASS_THROUGH` — the modern SATA SMART path.
+///
+/// Declared with write access by Windows even though SMART READ DATA only transfers
+/// data inward; the access bits describe the IOCTL, not our intent.
+pub const IOCTL_ATA_PASS_THROUGH: u32 = ctl_code(
+    FILE_DEVICE_CONTROLLER,
+    0x040b,
+    METHOD_BUFFERED,
+    FILE_READ_ACCESS | FILE_WRITE_ACCESS,
+);
 
 /// Issue a `DeviceIoControl` with a typed input and a byte output buffer.
 ///
@@ -61,7 +90,7 @@ pub fn device_io_control(
             Some(&mut returned),
             None,
         )
-        .map_err(|_| WinError::last(context))?;
+        .map_err(|e| WinError::from_win(context, &e))?;
     }
 
     Ok(returned)

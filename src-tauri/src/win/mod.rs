@@ -28,6 +28,19 @@ impl WinError {
     pub fn new(context: &'static str, code: u32) -> Self {
         Self { context, code }
     }
+
+    /// Take the code from a windows-rs error rather than re-reading `GetLastError`.
+    ///
+    /// Constructing a `windows::core::Error` can itself touch the Win32 API, so calling
+    /// `GetLastError()` afterwards may return a clobbered, unrelated value. That is not
+    /// theoretical: it made a failing ATA pass-through report ERROR_REVISION_MISMATCH
+    /// instead of its real cause.
+    pub fn from_win(context: &'static str, e: &windows::core::Error) -> Self {
+        let hr = e.code().0 as u32;
+        // HRESULT_FROM_WIN32 encodes win32 codes as 0x8007xxxx.
+        let code = if (hr >> 16) == 0x8007 { hr & 0xFFFF } else { hr };
+        Self { context, code }
+    }
 }
 
 impl fmt::Display for WinError {
