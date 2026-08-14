@@ -18,17 +18,21 @@
 
 use serde::{Deserialize, Serialize};
 
+use windows::Win32::System::SystemInformation::FIRMWARE_TABLE_PROVIDER;
+
 use crate::model::{Reading, Unavailable};
 use crate::win::{WinError, WinResult};
 
-const PROVIDER_RSMB: u32 = 0x5253_4D42; // 'RSMB'
-const PROVIDER_ACPI: u32 = 0x4143_5049; // 'ACPI'
+// Provider signatures are the four-character codes packed big-endian, matching the
+// multi-character literals ('RSMB', 'ACPI') used in the Win32 documentation.
+const PROVIDER_RSMB: FIRMWARE_TABLE_PROVIDER = FIRMWARE_TABLE_PROVIDER(0x5253_4D42);
+const PROVIDER_ACPI: FIRMWARE_TABLE_PROVIDER = FIRMWARE_TABLE_PROVIDER(0x4143_5049);
 
 // ---------------------------------------------------------------------------
 // Raw firmware table access
 // ---------------------------------------------------------------------------
 
-fn get_firmware_table(provider: u32, table_id: u32) -> WinResult<Vec<u8>> {
+fn get_firmware_table(provider: FIRMWARE_TABLE_PROVIDER, table_id: u32) -> WinResult<Vec<u8>> {
     use windows::Win32::System::SystemInformation::GetSystemFirmwareTable;
 
     unsafe {
@@ -46,7 +50,7 @@ fn get_firmware_table(provider: u32, table_id: u32) -> WinResult<Vec<u8>> {
     }
 }
 
-fn enum_firmware_tables(provider: u32) -> WinResult<Vec<[u8; 4]>> {
+fn enum_firmware_tables(provider: FIRMWARE_TABLE_PROVIDER) -> WinResult<Vec<[u8; 4]>> {
     use windows::Win32::System::SystemInformation::EnumSystemFirmwareTables;
 
     unsafe {
@@ -161,27 +165,28 @@ pub fn parse_smbios(raw: &[u8]) -> Vec<SmbiosStructure> {
         // The string set follows the formatted area, NUL-separated, double-NUL ended.
         let mut sp = pos + formatted_len;
         let mut strings = Vec::new();
-        let mut current = Vec::new();
 
-        while sp < data.len() {
-            let b = data[sp];
-            if b == 0 {
-                if current.is_empty() {
-                    // Second consecutive NUL terminates the whole set.
-                    sp += 1;
-                    break;
-                }
-                strings.push(String::from_utf8_lossy(&current).to_string());
-                current.clear();
+        if sp + 1 < data.len() && data[sp] == 0 && data[sp + 1] == 0 {
+            // A structure with no strings is terminated by *two* NULs. Consuming only
+            // one here misaligns every subsequent structure — which silently truncated
+            // the walk before Type 17 and made the machine look like it had no RAM.
+            sp += 2;
+        } else {
+            let mut current = Vec::new();
+            while sp < data.len() {
+                let b = data[sp];
                 sp += 1;
-                // A following NUL closes the set.
-                if sp < data.len() && data[sp] == 0 {
-                    sp += 1;
-                    break;
+                if b == 0 {
+                    if current.is_empty() {
+                        // Terminating NUL of the set; the previous string's own NUL
+                        // was already consumed.
+                        break;
+                    }
+                    strings.push(String::from_utf8_lossy(&current).to_string());
+                    current.clear();
+                } else {
+                    current.push(b);
                 }
-            } else {
-                current.push(b);
-                sp += 1;
             }
         }
 
@@ -256,11 +261,17 @@ pub struct SystemIdentity {
 /// A firmware-resident executable injection point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FirmwarePersistence {
-    /// True when the ACPI table list contains WPBT.
+    /// WPBT is in the live ACPI table list: firmware is injecting an executable that
+    /// Windows runs at every boot, surviving a disk wipe or drive swap.
     pub wpbt_present: bool,
+    /// `wpbbin.exe` exists on disk. Windows writes this when it executes a WPBT
+    /// payload, so it is evidence the mechanism has been used — possibly historically,
+    /// or by a benign OEM driver installer. It is **not** vendor-specific and on its
+    /// own says nothing about Absolute/Computrace.
+    pub wpbt_launcher_present: bool,
     /// Every ACPI table signature we saw, for the detailed view.
     pub acpi_tables: Vec<String>,
-    /// Absolute/Computrace agent artefacts found in the running system.
+    /// Files specific to the Absolute/Computrace agent. Only these justify naming it.
     pub absolute_agent_artifacts: Vec<String>,
 }
 
@@ -373,21 +384,25 @@ fn probe_persistence() -> FirmwarePersistence {
 
     FirmwarePersistence {
         wpbt_present,
+        wpbt_launcher_present: std::path::Path::new(WPBT_LAUNCHER).exists(),
         acpi_tables: signatures,
         absolute_agent_artifacts: find_absolute_artifacts(),
     }
 }
 
-/// Look for the user-mode half of Absolute/Computrace.
+/// The generic payload Windows extracts from a WPBT table. Any vendor can use it.
+const WPBT_LAUNCHER: &str = r"C:\Windows\System32\wpbbin.exe";
+
+/// Look for the user-mode half of Absolute/Computrace specifically.
 ///
-/// The firmware half drops these; their presence alongside WPBT upgrades the finding
-/// from "this machine has a firmware injection point" to "it is actively in use".
+/// The firmware half drops these two; their presence alongside WPBT upgrades the
+/// finding from "this machine has a firmware injection point" to "anti-theft tracking
+/// is actively installed". Deliberately narrow — a report that accuses a seller of
+/// shipping corporate tracking software had better be right.
 fn find_absolute_artifacts() -> Vec<String> {
-    const CANDIDATES: [&str; 4] = [
+    const CANDIDATES: [&str; 2] = [
         r"C:\Windows\System32\rpcnet.exe",
         r"C:\Windows\System32\rpcnetp.exe",
-        r"C:\Windows\System32\wpbbin.exe",
-        r"C:\Windows\System32\upgrd.exe",
     ];
 
     CANDIDATES
@@ -436,6 +451,44 @@ mod tests {
         assert_eq!(s.string_at(0x04).as_deref(), Some("MSI Corp."));
         assert_eq!(s.string_at(0x05).as_deref(), Some("MS-N014"));
         assert_eq!(s.string_at(0x19).as_deref(), Some("SKU-7"));
+    }
+
+    /// Regression: a structure with no strings is terminated by *two* NUL bytes.
+    /// Consuming only one desynchronises the walk, silently truncating the table.
+    /// That bug made a desktop with three DIMMs report zero memory devices, because
+    /// Type 17 sits after the first string-less structure.
+    #[test]
+    fn structure_without_strings_does_not_desync_the_walk() {
+        let mut table = Vec::new();
+        // Type 126 (inactive), length 4, no strings.
+        table.extend_from_slice(&[126, 0x04, 0x10, 0x00]);
+        table.extend_from_slice(&[0x00, 0x00]);
+        // Type 17, length 8, one string referenced at offset 7.
+        table.extend_from_slice(&[17, 0x08, 0x11, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        table.extend_from_slice(b"DIMM 0\0\0");
+
+        let mut raw = vec![0x00, 0x03, 0x07, 0x00];
+        raw.extend_from_slice(&(table.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&table);
+
+        let structs = parse_smbios(&raw);
+        assert_eq!(structs.len(), 2, "string-less structure desynced the walk");
+        assert_eq!(structs[0].struct_type, 126);
+        assert_eq!(structs[1].struct_type, 17, "Type 17 became unreachable");
+        assert_eq!(structs[1].strings, vec!["DIMM 0".to_string()]);
+    }
+
+    /// Guards the same bug against real firmware: every machine with RAM has at least
+    /// one Type 17 structure, so an empty result means the walk is truncating.
+    #[test]
+    fn memory_devices_are_reachable_on_this_machine() {
+        let (structs, _) = read_smbios();
+        assert!(
+            structs.iter().any(|s| s.struct_type == 17),
+            "no Type 17 memory devices found; parsed {} structures: {:?}",
+            structs.len(),
+            structs.iter().map(|s| s.struct_type).collect::<Vec<_>>()
+        );
     }
 
     #[test]

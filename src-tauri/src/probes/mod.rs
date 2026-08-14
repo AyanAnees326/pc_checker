@@ -5,6 +5,7 @@
 //! foundation of the M1 report.
 
 pub mod battery;
+pub mod battery_history;
 pub mod firmware;
 pub mod memory;
 pub mod storage;
@@ -18,6 +19,7 @@ use crate::model::{Reading, Unavailable};
 pub struct Inventory {
     pub firmware: firmware::FirmwareReport,
     pub batteries: Reading<Vec<battery::BatteryReport>>,
+    pub battery_history: Reading<battery_history::BatteryHistory>,
     pub memory: memory::MemoryReport,
     pub drives: Vec<storage::DriveReport>,
     pub elevated: bool,
@@ -46,9 +48,17 @@ pub fn collect() -> Inventory {
         Err(e) => Reading::failed(e),
     };
 
+    // Only worth the powercfg round-trip when there is a pack to have a history.
+    let battery_history = if batteries.is_ok() {
+        battery_history::probe()
+    } else {
+        Reading::missing(Unavailable::NotApplicable)
+    };
+
     Inventory {
         firmware,
         batteries,
+        battery_history,
         memory,
         drives: storage::probe(),
         elevated: crate::win::is_elevated(),

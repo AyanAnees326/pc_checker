@@ -510,8 +510,9 @@ mod tests {
 
     #[test]
     fn struct_layouts_match_the_kernel_abi() {
-        // BATTERY_INFORMATION is 4+1+3+4+4*6 = 40 bytes.
-        assert_eq!(std::mem::size_of::<BatteryInformationRaw>(), 40);
+        // BATTERY_INFORMATION: Capabilities(4) + Technology(1) + Reserved(3)
+        // + Chemistry(4) + six ULONGs(24) = 36 bytes, with no tail padding.
+        assert_eq!(std::mem::size_of::<BatteryInformationRaw>(), 36);
         assert_eq!(std::mem::size_of::<BatteryStatusRaw>(), 16);
         assert_eq!(std::mem::size_of::<BatteryQueryInformation>(), 12);
         assert_eq!(std::mem::size_of::<BatteryManufactureDate>(), 4);
@@ -522,7 +523,7 @@ mod tests {
     /// against 24420 mWh design. Health must land at ~99.1%, not 100%.
     #[test]
     fn health_matches_the_reference_screenshot() {
-        let health = (24198.0 / 24420.0) * 100.0;
+        let health: f64 = (24198.0 / 24420.0) * 100.0;
         assert!((health - 99.09).abs() < 0.05, "got {health}");
     }
 }
