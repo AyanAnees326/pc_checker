@@ -7,7 +7,9 @@
 pub mod ata_smart;
 pub mod battery;
 pub mod battery_history;
+pub mod crashes;
 pub mod firmware;
+pub mod gpu;
 pub mod memory;
 pub mod storage;
 
@@ -23,6 +25,8 @@ pub struct Inventory {
     pub battery_history: Reading<battery_history::BatteryHistory>,
     pub memory: memory::MemoryReport,
     pub drives: Vec<storage::DriveReport>,
+    pub gpus: Reading<Vec<gpu::GpuReport>>,
+    pub crashes: crashes::CrashHistory,
     pub elevated: bool,
     pub collected_at: String,
 }
@@ -62,6 +66,8 @@ pub fn collect() -> Inventory {
         battery_history,
         memory,
         drives: storage::probe(),
+        gpus: gpu::probe().into(),
+        crashes: crashes::probe(),
         elevated: crate::win::is_elevated(),
         collected_at: chrono::Utc::now().to_rfc3339(),
     }
