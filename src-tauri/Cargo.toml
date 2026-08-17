@@ -40,11 +40,13 @@ features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_EventLog",
     "Win32_System_ProcessStatus",
+    "Win32_System_LibraryLoader",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Direct3D_Fxc",
 ]
 
 [features]

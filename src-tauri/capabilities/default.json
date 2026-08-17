@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Allows the UI to receive the telemetry streams the backend emits. Tauri v2 does not gate this app's own #[tauri::command] functions behind the ACL, so the scan_* commands need nothing here — but the event system is a core plugin, and without core:event:default every listen() call is rejected and all streaming (live CPU metrics, CPU stress, GPU stress) silently produces nothing. Deliberately not core:default: this app needs events and nothing else from core, and a pre-purchase inspection tool that runs on other people's machines should ask for the narrowest surface that works.",
+  "windows": ["main"],
+  "permissions": ["core:event:default"]
+}

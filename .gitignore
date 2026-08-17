@@ -18,6 +18,9 @@ dist-ssr/
 Thumbs.db
 Desktop.ini
 
+# graphify call-graph cache — regenerated locally, not source
+/.graphify/
+
 # Runtime output — scan sessions and exported reports are per-machine artifacts
 /sessions/
 /reports/

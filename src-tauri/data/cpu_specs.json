@@ -1,0 +1,45 @@
+{
+  "_comment": "Seed dataset for Layer 1 (silicon spec) analysis — base/boost clock and TDP are manufacturer-published facts, verified against vendor spec pages / TechSpot / Intel ARK at the time each entry was added, not estimated. match_key is matched as a lowercased substring against the CPUID brand string. A CPU not found here degrades to a lower-confidence heuristic finding rather than blocking analysis — see analysis::stress_findings.",
+  "cpus": [
+    {
+      "match_key": "ryzen 5 7500f",
+      "display_name": "AMD Ryzen 5 7500F",
+      "vendor": "amd",
+      "base_clock_mhz": 3700,
+      "boost_clock_mhz": 5000,
+      "tdp_watts": 65,
+      "tjmax_celsius": null,
+      "source": "AMD product page / TechSpot, verified 2026-08"
+    },
+    {
+      "match_key": "i7-9750h",
+      "display_name": "Intel Core i7-9750H",
+      "vendor": "intel",
+      "base_clock_mhz": 2600,
+      "boost_clock_mhz": 4500,
+      "tdp_watts": 45,
+      "tjmax_celsius": 100,
+      "source": "Intel ARK, verified 2026-08"
+    },
+    {
+      "match_key": "ryzen 7 5800h",
+      "display_name": "AMD Ryzen 7 5800H",
+      "vendor": "amd",
+      "base_clock_mhz": 3200,
+      "boost_clock_mhz": 4400,
+      "tdp_watts": 45,
+      "tjmax_celsius": null,
+      "source": "AMD / TechSpot, verified 2026-08"
+    },
+    {
+      "match_key": "i5-1135g7",
+      "display_name": "Intel Core i5-1135G7",
+      "vendor": "intel",
+      "base_clock_mhz": 2400,
+      "boost_clock_mhz": 4200,
+      "tdp_watts": 28,
+      "tjmax_celsius": 100,
+      "source": "Intel ARK, verified 2026-08 (28W base-power SKU variant)"
+    }
+  ]
+}

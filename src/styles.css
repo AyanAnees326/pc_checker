@@ -1,15 +1,21 @@
 :root {
-  --bg: #12141a;
-  --surface: #1a1d26;
-  --text: #e7e9ee;
-  --muted: #9aa1b1;
-  --accent: #5b9dff;
+  --bg: #0b0d12;
+  --surface: #14171f;
+  --surface-2: #1b1f2a;
+  --border: #262b38;
+  --text: #eef0f4;
+  --muted: #8b93a7;
+  --accent: #37c9c9;
+  --accent-strong: #22a6a6;
+
   --ok: #3fb950;
-  --watch: #d29922;
-  --problem: #f85149;
+  --watch: #e0a52c;
+  --problem: #ef7b45;
+  --critical: #ef4444;
 
   color-scheme: dark;
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 15px;
 }
 
 * {
@@ -20,23 +26,33 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
+  line-height: 1.5;
 }
 
 .app {
-  max-width: 1100px;
+  max-width: 1400px;
   margin: 0 auto;
-  padding: 2rem 1.5rem 4rem;
+  padding: 2rem 1.5rem 5rem;
+}
+
+.app-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 1.75rem;
 }
 
 h1 {
   margin: 0;
-  font-size: 1.6rem;
-  letter-spacing: -0.01em;
+  font-size: 1.5rem;
+  letter-spacing: -0.02em;
 }
 
 .tagline {
-  margin: 0.25rem 0 1.5rem;
+  margin: 0.2rem 0 0;
   color: var(--muted);
+  font-size: 0.9rem;
 }
 
 button {
@@ -44,27 +60,447 @@ button {
   color: #06070a;
   border: 0;
   border-radius: 8px;
-  padding: 0.7rem 1.3rem;
-  font-size: 0.95rem;
+  padding: 0.6rem 1.2rem;
+  font-size: 0.9rem;
   font-weight: 600;
   cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 0.12s ease;
+}
+
+button:hover:not(:disabled) {
+  background: var(--accent-strong);
 }
 
 button:disabled {
-  opacity: 0.6;
+  opacity: 0.55;
   cursor: default;
 }
 
 .error {
   color: var(--problem);
+  background: rgba(239, 123, 69, 0.12);
+  border: 1px solid rgba(239, 123, 69, 0.3);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
 }
 
-.raw {
-  margin-top: 1.5rem;
-  padding: 1rem;
-  background: var(--surface);
+.empty,
+.note {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.note {
+  margin: 0.75rem 0 0;
+  font-style: italic;
+}
+
+/* --- Machine header --- */
+
+.machine {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
   border-radius: 10px;
-  overflow-x: auto;
-  font-size: 0.8rem;
-  line-height: 1.5;
+  padding: 0.85rem 1.1rem;
+  margin-bottom: 1rem;
+}
+
+.machine-name {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.machine-meta {
+  margin: 0.2rem 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-transform: capitalize;
+}
+
+/* --- Card grid --- */
+/*
+ * Each inventory component is an independent card in a responsive grid, so the page
+ * reads as a set of distinct instruments rather than one long scroll of prose. The
+ * live stress cards span the full grid width since their charts need the room.
+ */
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 1.25rem;
+  align-items: start;
+}
+
+.card-wide {
+  grid-column: 1 / -1;
+}
+
+/* --- Sections (cards) --- */
+
+.section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 1.4rem 1.5rem;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 8px 24px -16px rgba(0, 0, 0, 0.5);
+}
+
+.section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-bottom: 0.9rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.section-head h2 {
+  margin: 0;
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text);
+}
+
+.section-sub {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.section-action {
+  margin-left: auto;
+}
+
+/* Sub-blocks inside a component's section — e.g. CPU's "Live metrics" and "Stress
+   test" living together in one card instead of as separate cards. */
+.subsection {
+  margin-top: 1.25rem;
+  padding-top: 1.1rem;
+  border-top: 1px solid var(--border);
+}
+
+.subsection:first-of-type {
+  margin-top: 0.5rem;
+  padding-top: 0;
+  border-top: none;
+}
+
+.subsection .section-head {
+  border-bottom: none;
+  margin-bottom: 0.75rem;
+  padding-bottom: 0;
+}
+
+.subsection .section-head h3 {
+  margin: 0;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text);
+}
+
+.scan-btn {
+  padding: 0.4rem 0.9rem;
+  font-size: 0.82rem;
+  border-radius: 6px;
+}
+
+.scan-time {
+  margin: 0.75rem 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.elevation-badge {
+  cursor: default;
+}
+
+/* --- Fields --- */
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.15rem 1.5rem;
+}
+
+.field {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.3rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  font-size: 0.88rem;
+}
+
+.label {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A metric we could not read states why, and never masquerades as a number. */
+.missing {
+  color: var(--muted);
+  opacity: 0.65;
+  font-style: italic;
+  text-align: right;
+  font-size: 0.82rem;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1.25rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.88rem;
+}
+
+/* --- Findings --- */
+/* Nested one level inside a .section card, so they use surface-2 to stay visually
+   distinct from the card they live in rather than blending into it. */
+
+.finding {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: 10px;
+  padding: 0.9rem 1.1rem;
+  margin-bottom: 0.75rem;
+}
+
+.finding-critical { border-left-color: var(--critical); }
+.finding-problem  { border-left-color: var(--problem); }
+.finding-watch    { border-left-color: var(--watch); }
+.finding-ok       { border-left-color: var(--ok); }
+
+.finding-head {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin-bottom: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.finding-head h3 {
+  margin: 0;
+  font-size: 0.98rem;
+  font-weight: 600;
+}
+
+.cost {
+  margin-left: auto;
+  color: var(--watch);
+  font-weight: 600;
+}
+
+.finding dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.1rem 0.75rem;
+  margin: 0 0 0.6rem;
+  font-size: 0.85rem;
+}
+
+.finding dt {
+  color: var(--muted);
+}
+
+.finding dd {
+  margin: 0;
+}
+
+.advice {
+  margin: 0;
+  font-size: 0.88rem;
+  color: #cfd5e2;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.badge-ok       { background: rgba(63, 185, 80, 0.16);  color: var(--ok); }
+.badge-watch    { background: rgba(224, 165, 44, 0.16); color: var(--watch); }
+.badge-problem  { background: rgba(239, 123, 69, 0.18); color: var(--problem); }
+.badge-critical { background: var(--critical);          color: #fff; }
+
+.ok-details {
+  margin-top: 0.5rem;
+}
+
+.ok-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.88rem;
+  padding: 0.4rem 0;
+}
+
+/* --- Drives --- */
+
+.drive {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.9rem 1.1rem;
+  margin-bottom: 0.75rem;
+}
+
+.drive-head {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  margin-bottom: 0.5rem;
+}
+
+/* --- Battery history / live telemetry charts --- */
+
+.history {
+  margin-top: 1.25rem;
+}
+
+.history h4 {
+  margin: 0 0 0.2rem;
+  font-size: 0.9rem;
+}
+
+.history .muted {
+  margin: 0 0 0.6rem;
+  font-size: 0.85rem;
+}
+
+.chart {
+  width: 100%;
+  height: auto;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.chart .axis {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.chart .series {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+/* Additional series colors for multi-line telemetry charts (clock/power/temp). */
+.chart .series-2 { stroke: var(--watch); }
+.chart .series-3 { stroke: var(--problem); }
+.chart .series-4 { stroke: var(--critical); }
+
+.chart .swap {
+  stroke: var(--watch);
+  stroke-width: 1.5;
+  stroke-dasharray: 3 3;
+}
+
+.chart .throttle-band {
+  fill: var(--critical);
+  opacity: 0.12;
+}
+
+.chart .tick {
+  fill: var(--muted);
+  font-size: 10px;
+}
+
+.chart-legend {
+  display: flex;
+  gap: 1rem;
+  margin-top: 0.5rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  flex-wrap: wrap;
+}
+
+.chart-legend .swatch {
+  display: inline-block;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 2px;
+  margin-right: 0.35rem;
+  vertical-align: -1px;
+}
+
+/* --- Stress test phase / progress --- */
+
+.phase-strip {
+  display: flex;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.phase-chip {
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.phase-chip.active {
+  background: var(--accent);
+  color: #06070a;
+  border-color: var(--accent);
+}
+
+.phase-chip.done {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.stat-row {
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+.stat {
+  min-width: 90px;
+}
+
+.stat .stat-label {
+  display: block;
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.stat .stat-value {
+  display: block;
+  font-size: 1.35rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
 }

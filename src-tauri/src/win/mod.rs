@@ -6,7 +6,11 @@
 //! immune to crate churn and makes the layout auditable in one place.
 
 pub mod device;
+pub mod dynlib;
 pub mod ioctl;
+pub mod pci_lock;
+pub mod power;
+pub mod registry;
 
 use std::fmt;
 

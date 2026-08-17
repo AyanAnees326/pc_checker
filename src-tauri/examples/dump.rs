@@ -5,8 +5,16 @@
 
 fn main() {
     let inventory = pc_checker_lib::probes::collect();
-    match serde_json::to_string_pretty(&inventory) {
+    let findings = pc_checker_lib::analysis::findings::evaluate(&inventory);
+
+    #[derive(serde::Serialize)]
+    struct Dump {
+        inventory: pc_checker_lib::probes::Inventory,
+        findings: Vec<pc_checker_lib::model::Finding>,
+    }
+
+    match serde_json::to_string_pretty(&Dump { inventory, findings }) {
         Ok(json) => println!("{json}"),
-        Err(e) => eprintln!("failed to serialise inventory: {e}"),
+        Err(e) => eprintln!("failed to serialise scan result: {e}"),
     }
 }

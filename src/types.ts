@@ -1,4 +1,4 @@
-// Mirrors the Rust types in src-tauri/src/model.rs and probes/.
+// Mirrors the Rust types in src-tauri/src/model.rs, probes/ and analysis/.
 
 export type Unavailable = {
   kind:
@@ -20,9 +20,34 @@ export type Reading<T> =
   | { ok: true; value: T }
   | { ok: false; reason: Unavailable; note: string };
 
+/** The value, or `null` when the reading is missing. Never invents a default. */
 export function readingValue<T>(r: Reading<T> | undefined): T | null {
   return r && r.ok ? r.value : null;
 }
+
+/** The reason a reading is missing, for display next to an empty field. */
+export function readingNote(r: Reading<unknown> | undefined): string | null {
+  return r && !r.ok ? r.note : null;
+}
+
+// --- Findings ---------------------------------------------------------------
+
+export type Severity = "ok" | "watch" | "problem" | "critical";
+export type Confidence = "spec_grounded" | "cohort_grounded" | "heuristic";
+
+export interface Finding {
+  id: string;
+  title: string;
+  severity: Severity;
+  confidence: Confidence;
+  observed: string;
+  expected: string;
+  basis: string;
+  recommendation: string;
+  estimated_cost_usd?: number;
+}
+
+// --- Battery ----------------------------------------------------------------
 
 export type PowerState =
   | "charging"
@@ -76,6 +101,8 @@ export interface BatteryHistory {
   observation_days: number;
 }
 
+// --- Firmware ---------------------------------------------------------------
+
 export type FormFactor =
   | "laptop"
   | "desktop"
@@ -105,6 +132,7 @@ export interface SystemIdentity {
 
 export interface FirmwarePersistence {
   wpbt_present: boolean;
+  wpbt_launcher_present: boolean;
   acpi_tables: string[];
   absolute_agent_artifacts: string[];
 }
@@ -113,6 +141,8 @@ export interface FirmwareReport {
   identity: SystemIdentity;
   persistence: FirmwarePersistence;
 }
+
+// --- Memory -----------------------------------------------------------------
 
 export type ChannelConfig =
   | "single"
@@ -146,7 +176,10 @@ export interface MemoryReport {
   mismatched_modules: boolean;
 }
 
+// --- Storage ----------------------------------------------------------------
+
 export interface NvmeHealth {
+  protocol: "nvme";
   critical_warning: number;
   composite_temp_c: Reading<number>;
   available_spare_percent: Reading<number>;
@@ -162,6 +195,29 @@ export interface NvmeHealth {
   terabytes_written: Reading<number>;
 }
 
+export interface SmartAttribute {
+  id: number;
+  name: string;
+  current: number;
+  worst: number;
+  raw: number;
+}
+
+export interface AtaHealth {
+  protocol: "ata";
+  power_on_hours: Reading<number>;
+  power_cycles: Reading<number>;
+  reallocated_sectors: Reading<number>;
+  pending_sectors: Reading<number>;
+  uncorrectable_sectors: Reading<number>;
+  temperature_c: Reading<number>;
+  life_remaining_percent: Reading<number>;
+  terabytes_written: Reading<number>;
+  attributes: SmartAttribute[];
+}
+
+export type DriveHealth = NvmeHealth | AtaHealth;
+
 export interface DriveReport {
   index: number;
   model: Reading<string>;
@@ -169,8 +225,46 @@ export interface DriveReport {
   firmware: Reading<string>;
   bus_type: string;
   removable: boolean;
-  health: Reading<NvmeHealth>;
+  health: Reading<DriveHealth>;
 }
+
+// --- GPU --------------------------------------------------------------------
+
+export interface GpuReport {
+  name: string;
+  vendor: string;
+  vendor_id: number;
+  device_id: number;
+  subsystem_id: number;
+  revision: number;
+  dedicated_vram_bytes: number;
+  shared_memory_bytes: number;
+  is_software: boolean;
+  has_output: boolean;
+  driver_version: Reading<string>;
+  driver_date: Reading<string>;
+}
+
+// --- Crashes ----------------------------------------------------------------
+
+export interface CrashEvent {
+  timestamp: string;
+  source: string;
+  event_id: number;
+  level: string;
+}
+
+export interface CrashHistory {
+  minidump_count: number;
+  most_recent_minidump: Reading<string>;
+  minidumps_last_30_days: number;
+  full_memory_dump_present: boolean;
+  whea_events: Reading<CrashEvent[]>;
+  whea_uncorrected_count: number;
+  unexpected_shutdowns: Reading<CrashEvent[]>;
+}
+
+// --- Top level --------------------------------------------------------------
 
 export interface Inventory {
   firmware: FirmwareReport;
@@ -178,6 +272,121 @@ export interface Inventory {
   battery_history: Reading<BatteryHistory>;
   memory: MemoryReport;
   drives: DriveReport[];
+  gpus: Reading<GpuReport[]>;
+  crashes: CrashHistory;
   elevated: boolean;
   collected_at: string;
+}
+
+export interface ScanResult {
+  inventory: Inventory;
+  findings: Finding[];
+}
+
+// --- CPU stress test ---------------------------------------------------------
+
+export type CpuVendor = "intel" | "amd" | "other";
+
+export interface CpuTopology {
+  vendor: CpuVendor;
+  brand_string: Reading<string>;
+  physical_cores: Reading<number>;
+  logical_processors: number;
+  base_clock_mhz: Reading<number>;
+}
+
+export type StressPhase = "idle_baseline" | "single_thread_boost" | "all_core_sustained" | "cooldown";
+
+export const STRESS_PHASES: StressPhase[] = [
+  "idle_baseline",
+  "single_thread_boost",
+  "all_core_sustained",
+  "cooldown",
+];
+
+export const PHASE_LABEL: Record<StressPhase, string> = {
+  idle_baseline: "Idle baseline",
+  single_thread_boost: "Single-thread boost",
+  all_core_sustained: "All-core sustained",
+  cooldown: "Cooldown",
+};
+
+export interface CpuSample {
+  elapsed_ms: number;
+  phase: StressPhase;
+  effective_clock_mhz: Reading<number>;
+  package_power_watts: Reading<number>;
+  configured_pl1_watts: Reading<number>;
+  configured_pl2_watts: Reading<number>;
+  package_temperature_c: Reading<number>;
+  thermal_throttling: Reading<boolean>;
+  self_check_ok: boolean | null;
+  total_iterations: number;
+}
+
+export interface CpuStressResult {
+  samples: CpuSample[];
+  aborted: boolean;
+  abort_reason: string | null;
+  self_check_failed: boolean;
+}
+
+export interface StressStartedEvent {
+  topology: CpuTopology;
+}
+
+/** One sample from the standalone live CPU monitor — same telemetry as `CpuSample`,
+ * reviewable at ~1 Hz without running the full stress test. */
+export interface CpuLiveSample {
+  elapsed_ms: number;
+  effective_clock_mhz: Reading<number>;
+  package_power_watts: Reading<number>;
+  package_temperature_c: Reading<number>;
+  thermal_throttling: Reading<boolean>;
+}
+
+// --- GPU stress test ----------------------------------------------------------
+
+export type GpuStressPhase = "idle_baseline" | "compute_sustained" | "cooldown";
+
+export const GPU_STRESS_PHASES: GpuStressPhase[] = ["idle_baseline", "compute_sustained", "cooldown"];
+
+export const GPU_PHASE_LABEL: Record<GpuStressPhase, string> = {
+  idle_baseline: "Idle baseline",
+  compute_sustained: "Compute sustained",
+  cooldown: "Cooldown",
+};
+
+export interface GpuSample {
+  elapsed_ms: number;
+  phase: GpuStressPhase;
+  graphics_clock_mhz: Reading<number>;
+  power_watts: Reading<number>;
+  /** "GPU Temperature" on AMD; NVML's single sensor on NVIDIA. */
+  edge_temperature_c: Reading<number>;
+  /** Junction/die temperature. AMD-only. */
+  hotspot_temperature_c: Reading<number>;
+  /** AMD-only — no RPM equivalent in NVIDIA's public NVML API. */
+  fan_rpm: Reading<number>;
+  fan_percent: Reading<number>;
+  sw_thermal_slowdown: Reading<boolean>;
+  hw_thermal_slowdown: Reading<boolean>;
+  sw_power_cap: Reading<boolean>;
+  hw_power_brake: Reading<boolean>;
+  self_check_ok: boolean | null;
+  /** Compute dispatches submitted, each over the full 64 MiB working set. Correctness
+   *  is reported separately via `self_check_ok` — verification is sampled rather than
+   *  run per dispatch, because verifying every one is what starved the GPU. */
+  dispatches_completed: number;
+}
+
+export interface GpuStressResult {
+  samples: GpuSample[];
+  aborted: boolean;
+  abort_reason: string | null;
+  self_check_failed: boolean;
+}
+
+export interface GpuStressStartedEvent {
+  gpu: GpuReport;
 }

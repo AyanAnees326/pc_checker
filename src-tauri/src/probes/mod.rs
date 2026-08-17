@@ -4,13 +4,17 @@
 //! configuration changes, no sustained load. This is the whole of Quick Scan and the
 //! foundation of the M1 report.
 
+pub mod adl;
 pub mod ata_smart;
 pub mod battery;
 pub mod battery_history;
+pub mod cpu;
 pub mod crashes;
 pub mod firmware;
 pub mod gpu;
+pub mod gpu_d3d12;
 pub mod memory;
+pub mod nvml;
 pub mod storage;
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +25,7 @@ use crate::model::{Reading, Unavailable};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Inventory {
     pub firmware: firmware::FirmwareReport,
+    pub cpu: cpu::CpuTopology,
     pub batteries: Reading<Vec<battery::BatteryReport>>,
     pub battery_history: Reading<battery_history::BatteryHistory>,
     pub memory: memory::MemoryReport,
@@ -62,6 +67,7 @@ pub fn collect() -> Inventory {
 
     Inventory {
         firmware,
+        cpu: cpu::probe(),
         batteries,
         battery_history,
         memory,
