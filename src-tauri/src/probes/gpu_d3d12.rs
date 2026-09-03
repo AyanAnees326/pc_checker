@@ -31,10 +31,11 @@
 //! every checked dispatch reads one and rewrites the other in full.
 
 use windows::core::{s, Interface};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, RECT, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::{ID3DBlob, D3D_FEATURE_LEVEL_11_0};
+use windows::Win32::Graphics::Direct3D::{ID3DBlob, D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST};
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
@@ -99,6 +100,39 @@ const FMA_CHAINS: u32 = 4;
 /// runs dry, without queueing so far ahead that cancellation becomes sluggish.
 const FRAMES_IN_FLIGHT: usize = 3;
 
+// ---------------------------------------------------------------------------
+// Graphics (raster) pass
+//
+// The compute dispatch above is pure FP32 ALU work: it never touches the rasterizer,
+// the render-output/blend hardware (ROP), or a bound render target — the blocks a
+// game workload actually spends a large share of its time on. "All aspects loaded"
+// means those blocks too, not just the compute units, so every batch also draws one
+// fullscreen triangle into an off-screen render target with a pixel shader that runs
+// the same style of FMA chain per pixel. Self-checked the same way as the compute
+// buffers: the shader's output depends only on each pixel's fixed screen-space
+// position, so for a fixed viewport it is exactly reproducible draw to draw, and a
+// periodic copy-to-readback + checksum catches a fault in the raster/shader/ROP path
+// the same way `read_checksum` catches one in the compute path.
+// ---------------------------------------------------------------------------
+
+/// Off-screen render target dimensions. Chosen so the natural (unpadded) row pitch —
+/// `RT_WIDTH * 4` bytes for RGBA8 — is already a multiple of D3D12's mandatory 256-byte
+/// texture-copy row alignment, so the readback copy needs no per-row padding logic.
+const RT_WIDTH: u32 = 3840;
+const RT_HEIGHT: u32 = 2160;
+
+const _: () = assert!(
+    (RT_WIDTH * 4) % 256 == 0,
+    "RT_WIDTH * 4 must stay a multiple of 256 (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) for the unpadded readback copy below to be correct"
+);
+
+/// Per-pixel FMA iterations. Reuses [`SHADER_ITERS`]'s tuning rather than a separate
+/// constant: the render target has roughly half the compute dispatch's element count
+/// (8.3M pixels vs. 16.8M threads), so at the same per-invocation iteration count a
+/// draw takes roughly half as long as a dispatch — comfortably inside the same TDR
+/// margin already established for the compute path.
+const PS_ITERS: u32 = SHADER_ITERS;
+
 /// A healthy dispatch finishes in tens of milliseconds. Ten seconds means the device
 /// is hung or was reset out from under us; blocking forever (as this module used to)
 /// would hang the whole stress run with no diagnosis.
@@ -134,6 +168,46 @@ void CSMain(uint3 id : SV_DispatchThreadID) {{
     for (uint i = 0; i < {SHADER_ITERS}; i++) {{
 {body}    }}
     dst[id.x] = {sum};
+}}
+"#
+    )
+}
+
+/// Vertex + pixel shader source for the graphics pass. The vertex shader is the
+/// standard fullscreen-triangle trick — three vertices synthesized from `SV_VertexID`
+/// with no vertex/index buffer at all, covering the whole viewport with one triangle
+/// that overshoots it on two corners. The pixel shader's only input is its own
+/// rasterized screen position, so output is a pure function of the (fixed) viewport —
+/// deterministic and idempotent across draws, the same property `compute_shader_source`
+/// relies on for its self-check.
+fn graphics_shader_source() -> String {
+    format!(
+        r#"
+struct VSOut {{
+    float4 pos : SV_POSITION;
+}};
+
+VSOut VSMain(uint id : SV_VertexID) {{
+    VSOut o;
+    float2 uv = float2(float((id << 1) & 2), float(id & 2));
+    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return o;
+}}
+
+float4 PSMain(VSOut input) : SV_TARGET {{
+    float s = input.pos.x * 0.013 + input.pos.y * 0.029;
+    float v0 = s + 0.0;
+    float v1 = s + 0.25;
+    float v2 = s + 0.5;
+    float v3 = s + 0.75;
+    [loop]
+    for (uint i = 0; i < {PS_ITERS}; i++) {{
+        v0 = v0 * 0.9999991 + 1.0000003;
+        v1 = v1 * 0.9999991 + 1.0000003;
+        v2 = v2 * 0.9999991 + 1.0000003;
+        v3 = v3 * 0.9999991 + 1.0000003;
+    }}
+    return float4(frac(v0), frac(v1), frac(v2), frac(v3));
 }}
 "#
     )
@@ -187,6 +261,17 @@ pub struct GpuComputeContext {
     buf_dst: ID3D12Resource,
     buf_readback: ID3D12Resource,
     pub element_count: u32,
+
+    // Graphics (raster) pass — see the module-level "Graphics (raster) pass" comment.
+    root_signature_gfx: ID3D12RootSignature,
+    pso_gfx: ID3D12PipelineState,
+    render_target: ID3D12Resource,
+    /// Kept alive so `rtv_handle` (a raw offset into it) stays valid; never touched
+    /// again after `create()` computes that handle.
+    #[allow(dead_code)]
+    rtv_heap: ID3D12DescriptorHeap,
+    rtv_handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+    buf_readback_gfx: ID3D12Resource,
 }
 
 impl GpuComputeContext {
@@ -255,6 +340,29 @@ impl GpuComputeContext {
                 false,
             )?;
 
+            let root_signature_gfx = create_graphics_root_signature(&device)?;
+            let pso_gfx = create_graphics_pipeline_state(&device, &root_signature_gfx)?;
+            let render_target = create_render_target(&device)?;
+            let rtv_heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })
+                .map_err(|e| WinError::from_win("CreateDescriptorHeap(RTV)", &e))?;
+            let rtv_handle = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            device.CreateRenderTargetView(&render_target, None, rtv_handle);
+
+            let gfx_buffer_size = (RT_WIDTH as u64) * (RT_HEIGHT as u64) * 4;
+            let buf_readback_gfx = create_buffer(
+                &device,
+                gfx_buffer_size,
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                false,
+            )?;
+
             Ok(Self {
                 device,
                 queue,
@@ -270,6 +378,12 @@ impl GpuComputeContext {
                 buf_dst,
                 buf_readback,
                 element_count: ELEMENT_COUNT,
+                root_signature_gfx,
+                pso_gfx,
+                render_target,
+                rtv_heap,
+                rtv_handle,
+                buf_readback_gfx,
             })
         }
     }
@@ -389,6 +503,65 @@ impl GpuComputeContext {
                 );
             }
 
+            // Graphics (raster) pass: exactly one draw every batch, regardless of the
+            // compute dispatch count. See the module-level "Graphics (raster) pass"
+            // comment for why — this loads the rasterizer/pixel-shader-ALU/ROP path
+            // that the dispatches above never touch, sharing this same command list,
+            // ring slot and fence so it costs no new bookkeeping machinery.
+            frame.list.SetGraphicsRootSignature(&self.root_signature_gfx);
+            frame.list.SetPipelineState(&self.pso_gfx);
+            frame.list.RSSetViewports(&[D3D12_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: RT_WIDTH as f32,
+                Height: RT_HEIGHT as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]);
+            frame.list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: RT_WIDTH as i32, bottom: RT_HEIGHT as i32 }]);
+            frame.list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            frame
+                .list
+                .OMSetRenderTargets(1, Some(&self.rtv_handle as *const _), false, None);
+            frame.list.DrawInstanced(3, 1, 0, 0);
+
+            if capture_result {
+                transition(
+                    &frame.list,
+                    &self.render_target,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                );
+                let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::ManuallyDrop::new(Some(self.buf_readback_gfx.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: RT_WIDTH,
+                                Height: RT_HEIGHT,
+                                Depth: 1,
+                                RowPitch: RT_WIDTH * 4,
+                            },
+                        },
+                    },
+                };
+                let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::ManuallyDrop::new(Some(self.render_target.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                frame.list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+                transition(
+                    &frame.list,
+                    &self.render_target,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                );
+            }
+
             frame.list.Close().map_err(|e| WinError::from_win("CommandList.Close", &e))?;
             let lists = [Some(frame.list.cast::<ID3D12CommandList>().unwrap())];
             self.queue.ExecuteCommandLists(&lists);
@@ -434,6 +607,28 @@ impl GpuComputeContext {
             // Written range {0,0}: the CPU only read, so there is nothing to flush back.
             let written = D3D12_RANGE { Begin: 0, End: 0 };
             self.buf_readback.Unmap(0, Some(&written));
+            Ok(sum)
+        }
+    }
+
+    /// Fold a checksum out of the graphics pass's mapped readback buffer — the raster
+    /// self-check's counterpart to [`Self::read_checksum`]. Raw RGBA8 bytes rather than
+    /// `f32` bit patterns, but the same idea: any single corrupted byte anywhere in the
+    /// render target changes the fold.
+    pub fn read_graphics_checksum(&self) -> WinResult<u64> {
+        let byte_len = (RT_WIDTH as usize) * (RT_HEIGHT as usize) * 4;
+        unsafe {
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let range = D3D12_RANGE { Begin: 0, End: byte_len };
+            self.buf_readback_gfx
+                .Map(0, Some(&range), Some(&mut ptr as *mut _ as *mut _))
+                .map_err(|e| WinError::from_win("Map(readback_gfx)", &e))?;
+            let data = std::slice::from_raw_parts(ptr, byte_len);
+            let sum = data
+                .iter()
+                .fold(0u64, |acc, x| acc ^ (*x as u64).wrapping_mul(0x9E37_79B9));
+            let written = D3D12_RANGE { Begin: 0, End: 0 };
+            self.buf_readback_gfx.Unmap(0, Some(&written));
             Ok(sum)
         }
     }
@@ -667,6 +862,154 @@ unsafe fn create_pipeline_state(device: &ID3D12Device, root_sig: &ID3D12RootSign
     device
         .CreateComputePipelineState(&desc)
         .map_err(|e| WinError::from_win("CreateComputePipelineState", &e))
+}
+
+/// Empty root signature for the graphics pass: the pixel shader's only input is its
+/// own rasterized screen position (see [`graphics_shader_source`]), so there is
+/// nothing to bind — zero root parameters is a legitimate, minimal root signature, not
+/// a placeholder for something still to come.
+unsafe fn create_graphics_root_signature(device: &ID3D12Device) -> WinResult<ID3D12RootSignature> {
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: 0,
+                pParameters: std::ptr::null(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                ..Default::default()
+            },
+        },
+    };
+
+    let mut blob: Option<ID3DBlob> = None;
+    let mut error_blob: Option<ID3DBlob> = None;
+    D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error_blob))
+        .map_err(|e| WinError::from_win("D3D12SerializeVersionedRootSignature(graphics)", &e))?;
+    let blob = blob.ok_or_else(|| WinError::new("graphics root signature serialization returned no blob", 0))?;
+
+    let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+    device
+        .CreateRootSignature(0, bytes)
+        .map_err(|e| WinError::from_win("CreateRootSignature(graphics)", &e))
+}
+
+unsafe fn compile_hlsl(source: &str, entry: windows::core::PCSTR, target: windows::core::PCSTR) -> WinResult<ID3DBlob> {
+    let source_bytes = source.as_bytes();
+    let mut blob: Option<ID3DBlob> = None;
+    let mut error_blob: Option<ID3DBlob> = None;
+    let hr = D3DCompile(
+        source_bytes.as_ptr() as *const _,
+        source_bytes.len(),
+        None,
+        None,
+        None,
+        entry,
+        target,
+        0,
+        0,
+        &mut blob,
+        Some(&mut error_blob),
+    );
+    if hr.is_err() {
+        let msg = error_blob
+            .map(|b| {
+                let bytes = std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize());
+                String::from_utf8_lossy(bytes).to_string()
+            })
+            .unwrap_or_else(|| "unknown shader compile error".into());
+        return Err(WinError::new(Box::leak(format!("D3DCompile: {msg}").into_boxed_str()), 0));
+    }
+    blob.ok_or_else(|| WinError::new("D3DCompile returned no blob", 0))
+}
+
+unsafe fn create_graphics_pipeline_state(
+    device: &ID3D12Device,
+    root_sig: &ID3D12RootSignature,
+) -> WinResult<ID3D12PipelineState> {
+    let source = graphics_shader_source();
+    let vs_blob = compile_hlsl(&source, s!("VSMain"), s!("vs_5_0"))?;
+    let ps_blob = compile_hlsl(&source, s!("PSMain"), s!("ps_5_0"))?;
+
+    let mut rtv_formats = [DXGI_FORMAT_UNKNOWN; 8];
+    rtv_formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    let mut blend_desc = D3D12_BLEND_DESC::default();
+    // RenderTargetWriteMask defaults to 0 (nothing written) even with blending
+    // disabled — D3D12_COLOR_WRITE_ENABLE_ALL is R|G|B|A = 0x0F, and leaving this at
+    // its zero default would make every draw a silent no-op: the render target would
+    // never change, so a stale/cleared value would compare equal to itself forever and
+    // the self-check would never catch anything.
+    blend_desc.RenderTarget[0].RenderTargetWriteMask = 0x0F;
+
+    let rasterizer_desc = D3D12_RASTERIZER_DESC {
+        FillMode: D3D12_FILL_MODE_SOLID,
+        // NONE, not the API default BACK: this pipeline never establishes a specific
+        // winding order for the synthesized fullscreen triangle, and culling it away
+        // by accident would silently turn every draw into a no-op — the same failure
+        // shape as the write-mask footgun above.
+        CullMode: D3D12_CULL_MODE_NONE,
+        FrontCounterClockwise: BOOL(0),
+        DepthClipEnable: BOOL(1),
+        ..Default::default()
+    };
+
+    let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(root_sig.clone())),
+        VS: D3D12_SHADER_BYTECODE {
+            pShaderBytecode: vs_blob.GetBufferPointer(),
+            BytecodeLength: vs_blob.GetBufferSize(),
+        },
+        PS: D3D12_SHADER_BYTECODE {
+            pShaderBytecode: ps_blob.GetBufferPointer(),
+            BytecodeLength: ps_blob.GetBufferSize(),
+        },
+        BlendState: blend_desc,
+        // Full mask: 0 here would mean "no samples pass," i.e. nothing rendered.
+        SampleMask: u32::MAX,
+        RasterizerState: rasterizer_desc,
+        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        NumRenderTargets: 1,
+        RTVFormats: rtv_formats,
+        DSVFormat: DXGI_FORMAT_UNKNOWN,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+
+    device
+        .CreateGraphicsPipelineState(&desc)
+        .map_err(|e| WinError::from_win("CreateGraphicsPipelineState", &e))
+}
+
+unsafe fn create_render_target(device: &ID3D12Device) -> WinResult<ID3D12Resource> {
+    let heap_props = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: RT_WIDTH as u64,
+        Height: RT_HEIGHT,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        ..Default::default()
+    };
+
+    let mut resource: Option<ID3D12Resource> = None;
+    device
+        .CreateCommittedResource(
+            &heap_props,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            None,
+            &mut resource,
+        )
+        .map_err(|e| WinError::from_win("CreateCommittedResource(render target)", &e))?;
+    resource.ok_or_else(|| WinError::new("CreateCommittedResource(render target) returned no resource", 0))
 }
 
 /// Serializes tests that put the GPU under sustained load.

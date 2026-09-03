@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { createPortal } from "react-dom";
 
 import type {
   Finding,
@@ -9,10 +10,25 @@ import type {
   GpuStressPhase,
   GpuStressResult,
   GpuStressStartedEvent,
+  Reading,
 } from "../types";
 import { GPU_PHASE_LABEL, GPU_STRESS_PHASES, readingValue } from "../types";
-import { Empty, FindingList, Section } from "../ui";
-import { LiveChart } from "./LiveChart";
+import {
+  ComponentDetails,
+  DurationSelect,
+  Empty,
+  FindingList,
+  GraphsGroup,
+  ScanButton,
+  Section,
+  Stat,
+  StatusDot,
+  formatBytes,
+  useComponentScan,
+  worstSeverity,
+} from "../ui";
+import { MetricGraph } from "../ui/MetricGraph";
+import { computeThrottleBands } from "./throttle";
 
 type RunState =
   | { status: "idle" }
@@ -26,9 +42,15 @@ interface CompletePayload {
   scanned_at: string;
 }
 
-export function GpuStressCard() {
+const buttonClass =
+  "btn-gradient rounded-lg px-3.5 py-1.5 text-[0.82rem] font-semibold whitespace-nowrap border-0 cursor-pointer";
+const errorClass = "text-problem bg-problem/12 border border-problem/30 rounded-lg px-4 py-3";
+
+export function GpuStressCard({ graphsContainer }: { graphsContainer: HTMLDivElement | null }) {
   const [state, setState] = useState<RunState>({ status: "idle" });
   const unlistenRefs = useRef<Array<() => void>>([]);
+  const [durationMinutes, setDurationMinutes] = useState(11);
+  const [identity, runIdentityScan] = useComponentScan<Reading<GpuReport[]>>("scan_gpu");
 
   useEffect(() => {
     return () => {
@@ -64,14 +86,14 @@ export function GpuStressCard() {
     unlistenRefs.current = [unlistenStarted, unlistenSample, unlistenComplete];
 
     try {
-      await invoke("start_gpu_stress");
+      await invoke("start_gpu_stress", { durationSecs: durationMinutes * 60 });
     } catch (e) {
       setState({ status: "error", message: String(e) });
       unlistenStarted();
       unlistenSample();
       unlistenComplete();
     }
-  }, []);
+  }, [durationMinutes]);
 
   const cancel = useCallback(() => {
     invoke("cancel_gpu_stress").catch(() => {});
@@ -83,156 +105,202 @@ export function GpuStressCard() {
   const currentPhase: GpuStressPhase | null = latest?.phase ?? null;
   const currentPhaseIndex = currentPhase ? GPU_STRESS_PHASES.indexOf(currentPhase) : -1;
   const telemetryAvailable = latest ? readingValue(latest.graphics_clock_mhz) !== null : true;
-
-  return (
-    <Section
-      title="GPU stress test"
-      subtitle="~10 minutes — compute load plus a VRAM integrity check built into the same self-check"
-      action={
-        state.status === "running" ? (
-          <button className="scan-btn" onClick={cancel}>
-            Cancel
-          </button>
-        ) : (
-          <button className="scan-btn" onClick={start}>
-            {state.status === "done" ? "Run again" : "Start GPU stress test"}
-          </button>
-        )
-      }
-    >
-      {state.status === "idle" && (
-        <Empty>
-          Runs a compute shader against a large VRAM-resident buffer, self-checking every result — a
-          corrupted VRAM cell (the classic ex-mining-GPU failure mode) is caught the same way a compute
-          fault would be. Clock, power, temperature and fan readings need an NVIDIA (NVML) or AMD (ADL)
-          GPU; Intel runs the same stress and self-check without those readings.
-        </Empty>
-      )}
-
-      {state.status === "error" && <p className="error">{state.message}</p>}
-
-      {(state.status === "running" || state.status === "done") && (
-        <>
-          {gpu && (
-            <p className="muted" style={{ marginBottom: "0.75rem" }}>
-              {gpu.name} · {gpu.vendor}
-              {!telemetryAvailable &&
-                " · clock/power/temperature/fan unavailable (vendor telemetry is NVIDIA/AMD-only in this build)"}
-            </p>
-          )}
-
-          <div className="phase-strip">
-            {GPU_STRESS_PHASES.map((phase, i) => (
-              <span
-                key={phase}
-                className={
-                  "phase-chip" +
-                  (i === currentPhaseIndex ? " active" : i < currentPhaseIndex ? " done" : "")
-                }
-              >
-                {GPU_PHASE_LABEL[phase]}
-              </span>
-            ))}
-          </div>
-
-          {latest && (
-            <div className="stat-row">
-              <Stat label="Clock" value={readingValue(latest.graphics_clock_mhz)} suffix=" MHz" />
-              <Stat label="Power" value={readingValue(latest.power_watts)} suffix=" W" />
-              <Stat label="Edge temp" value={readingValue(latest.edge_temperature_c)} suffix=" °C" />
-              <Stat label="Hotspot temp" value={readingValue(latest.hotspot_temperature_c)} suffix=" °C" />
-              <Stat label="Fan" value={readingValue(latest.fan_rpm)} suffix=" RPM" />
-              <Stat label="Fan speed" value={readingValue(latest.fan_percent)} suffix="%" />
-              <Stat
-                label="Self-check"
-                value={latest.self_check_ok === null ? null : latest.self_check_ok ? "OK" : "FAILED"}
-              />
-              <Stat label="Dispatches" value={latest.dispatches_completed.toLocaleString()} />
-            </div>
-          )}
-
-          {samples.length > 1 && (
-            <LiveChart
-              elapsedMs={samples.map((s) => s.elapsed_ms)}
-              throttleBandsMs={throttleBands(samples)}
-              series={[
-                {
-                  label: "Clock",
-                  colorClass: "series",
-                  unit: "MHz",
-                  values: samples.map((s) => readingValue(s.graphics_clock_mhz)),
-                },
-                {
-                  label: "Power",
-                  colorClass: "series-2",
-                  unit: "W",
-                  values: samples.map((s) => readingValue(s.power_watts)),
-                },
-                {
-                  label: "Edge temp",
-                  colorClass: "series-3",
-                  unit: "°C",
-                  values: samples.map((s) => readingValue(s.edge_temperature_c)),
-                },
-                {
-                  label: "Hotspot temp",
-                  colorClass: "series-4",
-                  unit: "°C",
-                  values: samples.map((s) => readingValue(s.hotspot_temperature_c)),
-                },
-              ]}
-            />
-          )}
-
-          {state.status === "done" && (
-            <>
-              {state.result.aborted && (
-                <p className="note">
-                  Run stopped early{state.result.abort_reason ? `: ${state.result.abort_reason}` : "."}
-                </p>
-              )}
-              <div style={{ marginTop: "1rem" }}>
-                <FindingList findings={state.findings} />
-              </div>
-            </>
-          )}
-        </>
-      )}
-    </Section>
-  );
-}
-
-function Stat({ label, value, suffix }: { label: string; value: number | string | null; suffix?: string }) {
-  return (
-    <div className="stat">
-      <span className="stat-label">{label}</span>
-      <span className="stat-value">
-        {value === null ? <span className="missing">—</span> : `${value}${suffix ?? ""}`}
-      </span>
-    </div>
-  );
-}
-
-/** Contiguous [startMs, endMs] ranges where any throttle-reason bit read true. */
-function throttleBands(samples: GpuSample[]): [number, number][] {
-  const bands: [number, number][] = [];
-  let start: number | null = null;
-
-  for (const s of samples) {
-    const throttling =
+  const elapsedMs = samples.map((s) => s.elapsed_ms);
+  const throttleBandsMs = computeThrottleBands(
+    samples,
+    (s) =>
       readingValue(s.sw_thermal_slowdown) === true ||
       readingValue(s.hw_thermal_slowdown) === true ||
       readingValue(s.sw_power_cap) === true ||
-      readingValue(s.hw_power_brake) === true;
-    if (throttling) {
-      if (start === null) start = s.elapsed_ms;
-    } else if (start !== null) {
-      bands.push([start, s.elapsed_ms]);
-      start = null;
-    }
-  }
-  if (start !== null && samples.length > 0) {
-    bands.push([start, samples[samples.length - 1].elapsed_ms]);
-  }
-  return bands;
+      readingValue(s.hw_power_brake) === true
+  );
+  const identityList = identity.status === "done" ? readingValue(identity.data) : null;
+  const gpuName = identityList?.find((g) => !g.is_software)?.name ?? identityList?.[0]?.name ?? null;
+  const severity = worstSeverity([
+    ...(identity.status === "done" ? identity.findings : []),
+    ...(state.status === "done" ? state.findings : []),
+  ]);
+
+  return (
+    <>
+      <Section
+        title="GPU"
+        subtitle={gpuName ?? "Compute + raster pipeline stress, plus adapter identity"}
+        statusBadge={severity && <StatusDot severity={severity} />}
+        action={<ScanButton status={identity.status} onScan={runIdentityScan} label="adapter" />}
+      >
+      {identity.status === "idle" && (
+        <Empty>Enumerates display adapters over DXGI. No load is applied.</Empty>
+      )}
+      {identity.status === "error" && <p className={errorClass}>{identity.message}</p>}
+      {identity.status === "done" && (
+        <ComponentDetails>
+          {!identityList || identityList.length === 0 ? (
+            <Empty>{identity.data.ok ? "No display adapters were enumerated." : identity.data.note}</Empty>
+          ) : (
+            identityList.map((g, i) => (
+              <div key={i} className="flex items-center gap-3 py-1.5 border-b border-white/5 text-sm flex-wrap">
+                <strong>{g.name}</strong>
+                <span>
+                  {g.vendor}
+                  {g.is_software && " · software renderer"}
+                </span>
+                <span className="text-muted">
+                  {g.dedicated_vram_bytes > 0 ? formatBytes(g.dedicated_vram_bytes) : "no dedicated VRAM"}
+                </span>
+                <span className="text-muted">driver {readingValue(g.driver_version) ?? "unknown"}</span>
+              </div>
+            ))
+          )}
+        </ComponentDetails>
+      )}
+
+      <div className="mt-3 pt-3 border-t border-border">
+        <div className="flex items-center gap-2 flex-wrap">
+          {state.status !== "running" && (
+            <DurationSelect
+              value={durationMinutes}
+              onChange={setDurationMinutes}
+              options={[3, 5, 11, 15, 20, 30]}
+              defaultMinutes={11}
+            />
+          )}
+          {state.status === "running" ? (
+            <button className={buttonClass} onClick={cancel}>
+              Cancel
+            </button>
+          ) : (
+            <button className={buttonClass} onClick={start}>
+              {state.status === "done" ? "Run again" : "Start GPU stress test"}
+            </button>
+          )}
+        </div>
+
+        {state.status === "idle" && (
+          <Empty>
+            Compute + raster pipeline load with a VRAM integrity check, self-checking every result —
+            catches the corrupted-VRAM failure mode of ex-mining GPUs. Clock/power/temperature/fan
+            need an NVIDIA (NVML) or AMD (ADL) GPU; Intel runs the stress and self-check without them.
+          </Empty>
+        )}
+
+        {state.status === "error" && <p className={`${errorClass} mt-3`}>{state.message}</p>}
+
+        {(state.status === "running" || state.status === "done") && (
+          <>
+            {gpu && (
+              <p className="text-muted text-sm mt-3">
+                {gpu.name} · {gpu.vendor}
+                {!telemetryAvailable &&
+                  " · clock/power/temperature/fan unavailable (vendor telemetry is NVIDIA/AMD-only in this build)"}
+              </p>
+            )}
+
+            <div className="flex gap-1.5 mt-3 flex-wrap">
+              {GPU_STRESS_PHASES.map((phase, i) => (
+                <span
+                  key={phase}
+                  className={
+                    "phase-chip" +
+                    (i === currentPhaseIndex ? " active" : i < currentPhaseIndex ? " done" : "")
+                  }
+                >
+                  {GPU_PHASE_LABEL[phase]}
+                </span>
+              ))}
+            </div>
+
+            {latest && (
+              <div className="flex gap-6 flex-wrap mt-3">
+                <Stat
+                  label="Self-check"
+                  value={latest.self_check_ok === null ? null : latest.self_check_ok ? "OK" : "FAILED"}
+                />
+                <Stat
+                  label="Dispatches"
+                  value={latest.dispatches_completed}
+                  format={(v) => Math.round(v).toLocaleString()}
+                />
+              </div>
+            )}
+
+            {state.status === "done" && (
+              <>
+                {state.result.aborted && (
+                  <p className="mt-3 italic text-muted text-sm">
+                    Run stopped early{state.result.abort_reason ? `: ${state.result.abort_reason}` : "."}
+                  </p>
+                )}
+                <div className="mt-4">
+                  <FindingList findings={state.findings} />
+                </div>
+              </>
+            )}
+          </>
+        )}
+      </div>
+      </Section>
+
+      {graphsContainer &&
+        latest &&
+        (state.status === "running" || state.status === "done") &&
+        createPortal(
+          <GraphsGroup title="GPU — Stress test">
+            <MetricGraph
+              label="Clock"
+              colorClass="series"
+              unit="MHz"
+              suffix="MHz"
+              elapsedMs={elapsedMs}
+              values={samples.map((s) => readingValue(s.graphics_clock_mhz))}
+              throttleBandsMs={throttleBandsMs}
+            />
+            <MetricGraph
+              label="Power"
+              colorClass="series-2"
+              unit="W"
+              suffix="W"
+              elapsedMs={elapsedMs}
+              values={samples.map((s) => readingValue(s.power_watts))}
+              throttleBandsMs={throttleBandsMs}
+            />
+            <MetricGraph
+              label="Edge temp"
+              colorClass="series-3"
+              unit="°C"
+              suffix="°C"
+              elapsedMs={elapsedMs}
+              values={samples.map((s) => readingValue(s.edge_temperature_c))}
+              throttleBandsMs={throttleBandsMs}
+            />
+            <MetricGraph
+              label="Hotspot temp"
+              colorClass="series-4"
+              unit="°C"
+              suffix="°C"
+              elapsedMs={elapsedMs}
+              values={samples.map((s) => readingValue(s.hotspot_temperature_c))}
+              throttleBandsMs={throttleBandsMs}
+            />
+            <MetricGraph
+              label="Fan"
+              colorClass="series"
+              unit="RPM"
+              suffix="RPM"
+              elapsedMs={elapsedMs}
+              values={samples.map((s) => readingValue(s.fan_rpm))}
+            />
+            <MetricGraph
+              label="Fan speed"
+              colorClass="series-2"
+              unit="%"
+              suffix="%"
+              elapsedMs={elapsedMs}
+              values={samples.map((s) => readingValue(s.fan_percent))}
+            />
+          </GraphsGroup>,
+          graphsContainer
+        )}
+    </>
+  );
 }

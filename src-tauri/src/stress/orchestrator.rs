@@ -33,11 +33,31 @@ impl StressConfig {
     /// not a dedicated phase the user has to sit through before the actual test the
     /// button promised begins.
     pub fn standard() -> Self {
+        Self::for_duration(Duration::from_secs(14 * 60))
+    }
+
+    /// Build a schedule targeting `total` overall run length. `idle_baseline` and
+    /// `single_thread_boost` stay fixed at their calibration-reading lengths — they
+    /// exist to grab an idle/boost-clock sample, not to scale with the user's chosen
+    /// duration — and `cooldown` is a bounded fraction of the total so a short run
+    /// still gets a meaningful cooling-recovery reading and a long run doesn't spend
+    /// an outsized share of it doing nothing. Whatever remains goes to the actual
+    /// test: `all_core_sustained`. Feeding this the same total as the old hardcoded
+    /// `standard()` (14 minutes) reproduces its exact phase lengths.
+    pub fn for_duration(total: Duration) -> Self {
+        let idle_baseline = Duration::from_secs(5);
+        let single_thread_boost = Duration::from_secs(10);
+        let fixed = idle_baseline + single_thread_boost;
+        let cooldown = (total / 6).clamp(Duration::from_secs(15), Duration::from_secs(120));
+        let all_core_sustained = total
+            .checked_sub(fixed + cooldown)
+            .unwrap_or_default()
+            .max(Duration::from_secs(30));
         Self {
-            idle_baseline: Duration::from_secs(5),
-            single_thread_boost: Duration::from_secs(10),
-            all_core_sustained: Duration::from_secs(11 * 60) + Duration::from_secs(45),
-            cooldown: Duration::from_secs(2 * 60),
+            idle_baseline,
+            single_thread_boost,
+            all_core_sustained,
+            cooldown,
             sample_interval: Duration::from_millis(250),
         }
     }

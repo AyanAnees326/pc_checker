@@ -28,10 +28,26 @@ impl GpuStressConfig {
     /// (CPU orchestrator) for the same reasoning: a Start button that doesn't
     /// visibly start anything for a minute reads as broken.
     pub fn standard() -> Self {
+        Self::for_duration(Duration::from_secs(11 * 60))
+    }
+
+    /// Build a schedule targeting `total` overall run length. See `StressConfig::
+    /// for_duration` (CPU orchestrator) for the same reasoning: `idle_baseline` stays
+    /// fixed at its calibration-reading length, `cooldown` is a bounded fraction of
+    /// the total, and everything else goes to `compute_sustained`. Feeding this the
+    /// same total as the old hardcoded `standard()` (11 minutes) reproduces its exact
+    /// phase lengths.
+    pub fn for_duration(total: Duration) -> Self {
+        let idle_baseline = Duration::from_secs(5);
+        let cooldown = (total / 7).clamp(Duration::from_secs(15), Duration::from_secs(90));
+        let compute_sustained = total
+            .checked_sub(idle_baseline + cooldown)
+            .unwrap_or_default()
+            .max(Duration::from_secs(30));
         Self {
-            idle_baseline: Duration::from_secs(5),
-            compute_sustained: Duration::from_secs(9 * 60) + Duration::from_secs(25),
-            cooldown: Duration::from_secs(90),
+            idle_baseline,
+            compute_sustained,
+            cooldown,
             sample_interval: Duration::from_millis(250),
         }
     }

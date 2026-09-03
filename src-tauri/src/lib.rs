@@ -191,14 +191,15 @@ struct StressStarted {
     topology: probes::cpu::CpuTopology,
 }
 
-/// Start a CPU stress run. Streams `stress://cpu/sample` events at ~4 Hz for the
-/// duration of the twelve-minute phase schedule, then a single terminal
-/// `stress://cpu/complete` event carrying the full result and findings — the same
-/// `ComponentScan` shape every other scan command returns, just delivered at the end
-/// of a stream instead of as the command's own return value, since a multi-minute
-/// test cannot be a single request/response.
+/// Start a CPU stress run. `duration_secs` sets the total phase-schedule length (see
+/// `StressConfig::for_duration`); `None` falls back to the ~14-minute `standard()`
+/// schedule. Streams `stress://cpu/sample` events at ~4 Hz for the run's duration,
+/// then a single terminal `stress://cpu/complete` event carrying the full result and
+/// findings — the same `ComponentScan` shape every other scan command returns, just
+/// delivered at the end of a stream instead of as the command's own return value,
+/// since a multi-minute test cannot be a single request/response.
 #[tauri::command]
-fn start_cpu_stress(app: AppHandle, state: State<StressState>) -> Result<(), String> {
+fn start_cpu_stress(app: AppHandle, state: State<StressState>, duration_secs: Option<u64>) -> Result<(), String> {
     // Mutual exclusion with the live monitor — see `StressState`'s doc comment.
     stop_cpu_monitor_and_wait(&state)?;
 
@@ -217,7 +218,10 @@ fn start_cpu_stress(app: AppHandle, state: State<StressState>) -> Result<(), Str
             let topology = probes::cpu::probe();
             emit_event(&app, "stress://cpu/started", &StressStarted { topology: topology.clone() });
 
-            let config = stress::orchestrator::StressConfig::standard();
+            let config = match duration_secs {
+                Some(s) => stress::orchestrator::StressConfig::for_duration(std::time::Duration::from_secs(s)),
+                None => stress::orchestrator::StressConfig::standard(),
+            };
             let result = stress::orchestrator::run(&config, &cancel, |sample| {
                 emit_event(&app, "stress://cpu/sample", &sample);
             });
@@ -248,7 +252,7 @@ fn cancel_cpu_stress(state: State<StressState>) -> Result<(), String> {
 }
 
 /// Start the standalone live CPU metrics monitor — clock, wattage, temperature at
-/// ~1 Hz, reviewable without committing to the twelve-minute stress test. Streams
+/// ~1 Hz, reviewable without committing to the full multi-minute stress test. Streams
 /// `telemetry://cpu/live` events until `stop_cpu_monitor` is called.
 #[tauri::command]
 fn start_cpu_monitor(app: AppHandle, state: State<StressState>) -> Result<(), String> {
@@ -297,7 +301,7 @@ struct GpuStressStarted {
 /// Same streaming shape as `start_cpu_stress`: `stress://gpu/sample` events at ~4 Hz,
 /// then a terminal `stress://gpu/complete` carrying the full result and findings.
 #[tauri::command]
-fn start_gpu_stress(app: AppHandle, state: State<StressState>) -> Result<(), String> {
+fn start_gpu_stress(app: AppHandle, state: State<StressState>, duration_secs: Option<u64>) -> Result<(), String> {
     let gpus = probes::gpu::probe().map_err(|e| e.to_string())?;
     let gpu = gpus
         .into_iter()
@@ -315,7 +319,10 @@ fn start_gpu_stress(app: AppHandle, state: State<StressState>) -> Result<(), Str
         .spawn(move || {
             emit_event(&app, "stress://gpu/started", &GpuStressStarted { gpu: gpu.clone() });
 
-            let config = stress::gpu_orchestrator::GpuStressConfig::standard();
+            let config = match duration_secs {
+                Some(s) => stress::gpu_orchestrator::GpuStressConfig::for_duration(std::time::Duration::from_secs(s)),
+                None => stress::gpu_orchestrator::GpuStressConfig::standard(),
+            };
             let result = stress::gpu_orchestrator::run(gpu.vendor_id, gpu.device_id, &config, &cancel, |sample| {
                 emit_event(&app, "stress://gpu/sample", &sample);
             });

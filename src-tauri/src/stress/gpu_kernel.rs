@@ -23,6 +23,15 @@
 //! cell — the classic failure mode of an ex-mining GPU — shows up as a checksum
 //! mismatch exactly the same way a compute-unit fault would. A dedicated full-VRAM
 //! sweep independent of compute load remains a reasonable future addition.
+//!
+//! Compute-only load leaves real chip area idle: the rasterizer, the render-target
+//! output/blend hardware (ROP), and pixel-shader ALUs are all different hardware from
+//! the compute units above and a pure `Dispatch` loop never touches them, even though
+//! this is exactly the mix a game workload spends much of its time on. Every batch
+//! `submit_batch` records now also draws a fullscreen triangle into an off-screen
+//! render target (see `probes::gpu_d3d12`'s "Graphics (raster) pass" comment), so this
+//! worker keeps both the compute and the raster/ROP side of the chip loaded, and both
+//! are self-checked the same way — a fault in either one fails the run.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -111,10 +120,14 @@ pub fn run_worker(
         return Ok(());
     }
 
-    // First dispatch establishes the reference result and warms the pipeline.
+    // First batch establishes the reference results — compute *and* graphics, since
+    // `submit_batch` now records one fullscreen draw alongside the dispatches every
+    // time (see `probes::gpu_d3d12`'s "Graphics (raster) pass" comment) — and warms
+    // the pipeline.
     ctx.submit_batch(1, true)?;
     ctx.wait_for_submitted()?;
     let reference = ctx.read_checksum()?;
+    let graphics_reference = ctx.read_graphics_checksum()?;
     if cancel.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -154,8 +167,15 @@ pub fn run_worker(
             if ctx.is_complete(fence) {
                 match ctx.read_checksum() {
                     Ok(sum) if sum == reference => {}
-                    Ok(_) => stats.fault.store(true, Ordering::Relaxed),
-                    Err(_) => stats.fault.store(true, Ordering::Relaxed),
+                    _ => stats.fault.store(true, Ordering::Relaxed),
+                }
+                // Graphics is checked the same way as compute — a fault in either the
+                // raster/pixel-shader/ROP path or the compute path fails the same
+                // single self-check, since both are real hardware this stress test is
+                // meant to exercise.
+                match ctx.read_graphics_checksum() {
+                    Ok(sum) if sum == graphics_reference => {}
+                    _ => stats.fault.store(true, Ordering::Relaxed),
                 }
                 pending_check = None;
                 last_check = Instant::now();

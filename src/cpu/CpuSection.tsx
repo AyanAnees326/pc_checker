@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { createPortal } from "react-dom";
 
 import type {
   CpuLiveSample,
@@ -12,14 +13,31 @@ import type {
   StressStartedEvent,
 } from "../types";
 import { PHASE_LABEL, STRESS_PHASES, readingValue } from "../types";
-import { Empty, Field, FindingList, Plain, ScanButton, Section, useComponentScan } from "../ui";
-import { LiveChart } from "../stress/LiveChart";
+import {
+  ComponentDetails,
+  DurationSelect,
+  Empty,
+  Field,
+  FindingList,
+  GraphsGroup,
+  Plain,
+  ScanButton,
+  Section,
+  Skeleton,
+  Stat,
+  StatusDot,
+  useComponentScan,
+  worstSeverity,
+} from "../ui";
+import { MetricGraph } from "../ui/MetricGraph";
+import { computeThrottleBands } from "../stress/throttle";
 
 /**
- * The CPU section: topology, a standalone live metrics monitor (clock/wattage/temp,
- * reviewable without running the stress test), and the stress test itself — one
- * section per component, per component owning everything about it, rather than
- * topology and stress living in separate cards the way they used to.
+ * The CPU card: a compact status/controls surface (topology scan, live monitor,
+ * stress test) with the full topology spec tucked behind a `ComponentDetails`
+ * dropdown, and every `MetricGraph` teleported into the shared graphs panel below
+ * the card grid via `graphsContainer` rather than rendered inline — the card stays
+ * small regardless of how much telemetry is streaming.
  */
 
 // While a stress run is active, the chart is fed only the trailing window below
@@ -66,7 +84,11 @@ type MonitorState =
   | { status: "running"; samples: CpuLiveSample[] }
   | { status: "error"; message: string };
 
-export function CpuSection() {
+const buttonClass =
+  "btn-gradient rounded-lg px-3.5 py-1.5 text-[0.82rem] font-semibold whitespace-nowrap border-0 cursor-pointer";
+const errorClass = "text-problem bg-problem/12 border border-problem/30 rounded-lg px-4 py-3";
+
+export function CpuSection({ graphsContainer }: { graphsContainer: HTMLDivElement | null }) {
   const [topology, runTopologyScan] = useComponentScan<CpuTopology>("scan_cpu");
   const [pawnioStatus, setPawnioStatus] = useState<
     { ready: true } | { ready: false; detail: string } | null
@@ -77,6 +99,7 @@ export function CpuSection() {
 
   const [stress, setStress] = useState<StressState>({ status: "idle" });
   const stressUnlistenRefs = useRef<Array<() => void>>([]);
+  const [durationMinutes, setDurationMinutes] = useState(14);
 
   useEffect(() => {
     invoke<{ state: string; detail?: string }>("pawnio_status")
@@ -153,13 +176,13 @@ export function CpuSection() {
 
       stressUnlistenRefs.current = [unlistenStarted, unlistenSample, unlistenComplete];
 
-      await invoke("start_cpu_stress");
+      await invoke("start_cpu_stress", { durationSecs: durationMinutes * 60 });
     } catch (e) {
       setStress({ status: "error", message: String(e) });
       stressUnlistenRefs.current.forEach((u) => u());
       stressUnlistenRefs.current = [];
     }
-  }, [monitor.status, stopMonitor]);
+  }, [monitor.status, stopMonitor, durationMinutes]);
 
   const cancelStress = useCallback(() => {
     invoke("cancel_cpu_stress").catch(() => {});
@@ -176,247 +199,216 @@ export function CpuSection() {
       : stress.status === "done"
       ? stress.result.samples
       : [];
+  const chartElapsedMs = chartSamples.map((s) => s.elapsed_ms);
+  const chartThrottleBands = computeThrottleBands(chartSamples, (s) => readingValue(s.thermal_throttling) === true);
 
-  const latestLive = monitor.status === "running" ? monitor.samples[monitor.samples.length - 1] : undefined;
   const monitorChartSamples = monitor.status === "running" ? rebaseElapsed(monitor.samples) : [];
+  const monitorElapsedMs = monitorChartSamples.map((s) => s.elapsed_ms);
+
+  const severity = worstSeverity([
+    ...(topology.status === "done" ? topology.findings : []),
+    ...(stress.status === "done" ? stress.findings : []),
+  ]);
+
+  const cpuName = topology.status === "done" ? readingValue(topology.data.brand_string) : null;
 
   return (
-    <Section
-      title="CPU"
-      subtitle="Topology, live metrics, and the full stress test — everything about this part in one place"
-      action={<ScanButton status={topology.status} onScan={runTopologyScan} label="topology" />}
-    >
+    <>
+      <Section
+        title="CPU"
+        subtitle={cpuName ?? "Live metrics and the full stress test"}
+        action={<ScanButton status={topology.status} onScan={runTopologyScan} label="topology" />}
+        statusBadge={severity && <StatusDot severity={severity} />}
+      >
       {topology.status === "idle" && (
         <Empty>Reads vendor, brand string, core counts and base clock via CPUID. No load is applied.</Empty>
       )}
-      {topology.status === "error" && <p className="error">{topology.message}</p>}
+      {topology.status === "loading" && <Skeleton />}
+      {topology.status === "error" && <p className={errorClass}>{topology.message}</p>}
       {topology.status === "done" && (
-        <div className="grid" style={{ marginBottom: "1rem" }}>
-          <Field label="Model" reading={topology.data.brand_string} />
-          <Field label="Physical cores" reading={topology.data.physical_cores} />
-          <Plain label="Logical processors">{topology.data.logical_processors}</Plain>
-          <Field label="Base clock" reading={topology.data.base_clock_mhz} suffix="MHz" />
-        </div>
+        <ComponentDetails>
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-x-6 gap-y-[0.15rem] mb-3">
+            <Field label="Model" reading={topology.data.brand_string} />
+            <Field label="Physical cores" reading={topology.data.physical_cores} />
+            <Plain label="Logical processors">{topology.data.logical_processors}</Plain>
+            <Field label="Base clock" reading={topology.data.base_clock_mhz} suffix="MHz" />
+          </div>
+          <p className="text-muted text-sm">
+            Reading a CPU's internal power/thermal registers isn't possible from ordinary user-space
+            code on Windows — it genuinely requires a kernel driver. Tools like MSI Afterburner
+            aren't an exception to this: Afterburner silently installs its own driver
+            (<code>RTCore64.sys</code>) as part of its own installer, and that driver grants{" "}
+            <em>any</em> program unrestricted read/write access to memory and CPU registers — which
+            is exactly why it's flagged in security tooling as an abusable driver, the same category
+            WinRing0 (the older driver most hardware monitors used) was blocklisted for. PawnIO takes
+            the opposite approach: it only runs small, specific, auditable modules rather than
+            exposing raw access to whatever asks. Installing it is optional here, and the stress test
+            and its correctness check run identically with or without it — only the power/thermal
+            telemetry depends on it.
+          </p>
+        </ComponentDetails>
       )}
 
       {pawnioStatus !== null && !pawnioStatus.ready && (
-        <p className="note">
+        <p className="mt-3 italic text-muted text-sm">
           PawnIO clock, power and temperature readings are unavailable ({pawnioStatus.detail}) — the
           self-check (which catches real computation faults) still runs normally regardless. If PawnIO
           isn't installed, get it from{" "}
-          <a href="https://pawnio.eu/" target="_blank" rel="noreferrer">
+          <a href="https://pawnio.eu/" target="_blank" rel="noreferrer" className="text-accent-2">
             pawnio.eu
           </a>
           .
         </p>
       )}
 
-      <details className="ok-details">
-        <summary>Why does full diagnostics need a driver at all?</summary>
-        <p className="muted" style={{ marginTop: "0.5rem" }}>
-          Reading a CPU's internal power/thermal registers isn't possible from ordinary
-          user-space code on Windows — it genuinely requires a kernel driver. Tools like MSI
-          Afterburner aren't an exception to this: Afterburner silently installs its own driver
-          (<code>RTCore64.sys</code>) as part of its own installer, and that driver grants{" "}
-          <em>any</em> program unrestricted read/write access to memory and CPU registers — which
-          is exactly why it's flagged in security tooling as an abusable driver, the same category
-          WinRing0 (the older driver most hardware monitors used) was blocklisted for. PawnIO takes
-          the opposite approach: it only runs small, specific, auditable modules rather than
-          exposing raw access to whatever asks. Installing it is optional here, and the stress test
-          and its correctness check run identically with or without it — only the power/thermal
-          telemetry depends on it.
-        </p>
-      </details>
-
-      <div className="subsection">
-        <div className="section-head">
-          <h3>Live metrics</h3>
-          <div className="section-action">
-            {monitor.status === "running" ? (
-              <button className="scan-btn" onClick={stopMonitor}>
-                Stop live metrics
-              </button>
-            ) : (
-              <button className="scan-btn" onClick={startMonitor} disabled={stress.status === "running"}>
-                Start live metrics
-              </button>
-            )}
-          </div>
+      <div className="mt-3 pt-3 border-t border-border">
+        <div className="flex items-center gap-2 flex-wrap">
+          {monitor.status === "running" ? (
+            <button className={buttonClass} onClick={stopMonitor}>
+              Stop live metrics
+            </button>
+          ) : (
+            <button className={buttonClass} onClick={startMonitor} disabled={stress.status === "running"}>
+              Start live metrics
+            </button>
+          )}
+          {stress.status !== "running" && (
+            <DurationSelect
+              value={durationMinutes}
+              onChange={setDurationMinutes}
+              options={[3, 5, 10, 14, 20, 30]}
+              defaultMinutes={14}
+            />
+          )}
+          {stress.status === "running" ? (
+            <button className={buttonClass} onClick={cancelStress}>
+              Cancel stress test
+            </button>
+          ) : (
+            <button className={buttonClass} onClick={startStress}>
+              {stress.status === "done" ? "Run stress test again" : "Start stress test"}
+            </button>
+          )}
         </div>
 
-        {monitor.status === "stopped" && (
+        {monitor.status === "stopped" && stress.status === "idle" && (
           <Empty>
-            Clock speed, wattage and temperature, updated about once a second — no need to run the
-            full stress test just to see current CPU metrics.
+            Live metrics show current clock/power/temperature; the stress test adds sustained
+            all-core load with the same telemetry, plus cache/memory traffic.
           </Empty>
         )}
-        {monitor.status === "error" && <p className="error">{monitor.message}</p>}
-        {monitor.status === "running" && (
-          <>
-            {latestLive && (
-              <div className="stat-row">
-                <Stat label="Clock" value={readingValue(latestLive.effective_clock_mhz)} suffix=" MHz" />
-                <Stat label="Power" value={readingValue(latestLive.package_power_watts)} suffix=" W" />
-                <Stat label="Temp" value={readingValue(latestLive.package_temperature_c)} suffix=" °C" />
-              </div>
-            )}
-            {monitorChartSamples.length > 1 && (
-              <LiveChart
-                elapsedMs={monitorChartSamples.map((s) => s.elapsed_ms)}
-                series={[
-                  {
-                    label: "Clock",
-                    colorClass: "series",
-                    unit: "MHz",
-                    values: monitorChartSamples.map((s) => readingValue(s.effective_clock_mhz)),
-                  },
-                  {
-                    label: "Power",
-                    colorClass: "series-2",
-                    unit: "W",
-                    values: monitorChartSamples.map((s) => readingValue(s.package_power_watts)),
-                  },
-                  {
-                    label: "Temp",
-                    colorClass: "series-3",
-                    unit: "°C",
-                    values: monitorChartSamples.map((s) => readingValue(s.package_temperature_c)),
-                  },
-                ]}
-              />
-            )}
-          </>
-        )}
-      </div>
-
-      <div className="subsection">
-        <div className="section-head">
-          <h3>Stress test</h3>
-          <span className="section-sub">~12 minutes — sustained load with the same telemetry</span>
-          <div className="section-action">
-            {stress.status === "running" ? (
-              <button className="scan-btn" onClick={cancelStress}>
-                Cancel
-              </button>
-            ) : (
-              <button className="scan-btn" onClick={startStress}>
-                {stress.status === "done" ? "Run again" : "Start CPU stress test"}
-              </button>
-            )}
-          </div>
-        </div>
-
-        {stress.status === "idle" && (
-          <Empty>
-            Runs real FMA workloads on every core, self-checking every result for computation errors,
-            while recording clock speed, power draw and temperature (when PawnIO is available).
-          </Empty>
-        )}
-
-        {stress.status === "error" && <p className="error">{stress.message}</p>}
+        {monitor.status === "error" && <p className={`${errorClass} mt-3`}>{monitor.message}</p>}
+        {stress.status === "error" && <p className={`${errorClass} mt-3`}>{stress.message}</p>}
 
         {(stress.status === "running" || stress.status === "done") && (
-          <>
-            <div className="phase-strip">
-              {STRESS_PHASES.map((phase, i) => (
-                <span
-                  key={phase}
-                  className={
-                    "phase-chip" +
-                    (i === currentPhaseIndex ? " active" : i < currentPhaseIndex ? " done" : "")
-                  }
-                >
-                  {PHASE_LABEL[phase]}
-                </span>
-              ))}
-            </div>
+          <div className="flex gap-1.5 mt-3 flex-wrap">
+            {STRESS_PHASES.map((phase, i) => (
+              <span
+                key={phase}
+                className={
+                  "phase-chip" +
+                  (i === currentPhaseIndex ? " active" : i < currentPhaseIndex ? " done" : "")
+                }
+              >
+                {PHASE_LABEL[phase]}
+              </span>
+            ))}
+          </div>
+        )}
 
-            {latestStress && (
-              <div className="stat-row">
-                <Stat label="Clock" value={readingValue(latestStress.effective_clock_mhz)} suffix=" MHz" />
-                <Stat label="Power" value={readingValue(latestStress.package_power_watts)} suffix=" W" />
-                <Stat label="Temp" value={readingValue(latestStress.package_temperature_c)} suffix=" °C" />
-                <Stat
-                  label="Self-check"
-                  value={latestStress.self_check_ok === null ? null : latestStress.self_check_ok ? "OK" : "FAILED"}
-                />
-                <Stat label="Iterations" value={latestStress.total_iterations.toLocaleString()} />
-              </div>
-            )}
+        {latestStress && (stress.status === "running" || stress.status === "done") && (
+          <div className="flex gap-6 flex-wrap mt-3">
+            <Stat
+              label="Self-check"
+              value={latestStress.self_check_ok === null ? null : latestStress.self_check_ok ? "OK" : "FAILED"}
+            />
+            <Stat
+              label="Iterations"
+              value={latestStress.total_iterations}
+              format={(v) => Math.round(v).toLocaleString()}
+            />
+          </div>
+        )}
 
-            {chartSamples.length > 1 && (
-              <LiveChart
-                elapsedMs={chartSamples.map((s) => s.elapsed_ms)}
-                throttleBandsMs={throttleBands(chartSamples)}
-                series={[
-                  {
-                    label: "Clock",
-                    colorClass: "series",
-                    unit: "MHz",
-                    values: chartSamples.map((s) => readingValue(s.effective_clock_mhz)),
-                  },
-                  {
-                    label: "Power",
-                    colorClass: "series-2",
-                    unit: "W",
-                    values: chartSamples.map((s) => readingValue(s.package_power_watts)),
-                  },
-                  {
-                    label: "Temp",
-                    colorClass: "series-3",
-                    unit: "°C",
-                    values: chartSamples.map((s) => readingValue(s.package_temperature_c)),
-                  },
-                ]}
-              />
-            )}
+        {stress.status === "done" && stress.result.aborted && (
+          <p className="mt-3 italic text-muted text-sm">
+            Run stopped early{stress.result.abort_reason ? `: ${stress.result.abort_reason}` : "."}
+          </p>
+        )}
 
-            {stress.status === "done" && (
-              <>
-                {stress.result.aborted && (
-                  <p className="note">
-                    Run stopped early{stress.result.abort_reason ? `: ${stress.result.abort_reason}` : "."}
-                  </p>
-                )}
-                <div style={{ marginTop: "1rem" }}>
-                  <FindingList findings={stress.findings} />
-                </div>
-              </>
-            )}
-          </>
+        {stress.status === "done" && (
+          <div className="mt-4">
+            <FindingList findings={stress.findings} />
+          </div>
         )}
       </div>
-    </Section>
+      </Section>
+
+      {graphsContainer &&
+        createPortal(
+          <>
+            {monitor.status === "running" && (
+              <GraphsGroup title="CPU — Live metrics">
+                <MetricGraph
+                  label="Clock"
+                  colorClass="series"
+                  unit="MHz"
+                  suffix="MHz"
+                  elapsedMs={monitorElapsedMs}
+                  values={monitorChartSamples.map((s) => readingValue(s.effective_clock_mhz))}
+                />
+                <MetricGraph
+                  label="Power"
+                  colorClass="series-2"
+                  unit="W"
+                  suffix="W"
+                  elapsedMs={monitorElapsedMs}
+                  values={monitorChartSamples.map((s) => readingValue(s.package_power_watts))}
+                />
+                <MetricGraph
+                  label="Temp"
+                  colorClass="series-3"
+                  unit="°C"
+                  suffix="°C"
+                  elapsedMs={monitorElapsedMs}
+                  values={monitorChartSamples.map((s) => readingValue(s.package_temperature_c))}
+                />
+              </GraphsGroup>
+            )}
+            {(stress.status === "running" || stress.status === "done") && latestStress && (
+              <GraphsGroup title="CPU — Stress test">
+                <MetricGraph
+                  label="Clock"
+                  colorClass="series"
+                  unit="MHz"
+                  suffix="MHz"
+                  elapsedMs={chartElapsedMs}
+                  values={chartSamples.map((s) => readingValue(s.effective_clock_mhz))}
+                  throttleBandsMs={chartThrottleBands}
+                />
+                <MetricGraph
+                  label="Power"
+                  colorClass="series-2"
+                  unit="W"
+                  suffix="W"
+                  elapsedMs={chartElapsedMs}
+                  values={chartSamples.map((s) => readingValue(s.package_power_watts))}
+                  throttleBandsMs={chartThrottleBands}
+                />
+                <MetricGraph
+                  label="Temp"
+                  colorClass="series-3"
+                  unit="°C"
+                  suffix="°C"
+                  elapsedMs={chartElapsedMs}
+                  values={chartSamples.map((s) => readingValue(s.package_temperature_c))}
+                  throttleBandsMs={chartThrottleBands}
+                />
+              </GraphsGroup>
+            )}
+          </>,
+          graphsContainer
+        )}
+    </>
   );
-}
-
-function Stat({ label, value, suffix }: { label: string; value: number | string | null; suffix?: string }) {
-  return (
-    <div className="stat">
-      <span className="stat-label">{label}</span>
-      <span className="stat-value">
-        {value === null ? <span className="missing">—</span> : `${value}${suffix ?? ""}`}
-      </span>
-    </div>
-  );
-}
-
-/** Contiguous [startMs, endMs] ranges where the thermal-throttle bit read true. */
-function throttleBands(samples: CpuSample[]): [number, number][] {
-  const bands: [number, number][] = [];
-  let start: number | null = null;
-
-  for (const s of samples) {
-    const throttling = readingValue(s.thermal_throttling);
-    if (throttling === true) {
-      if (start === null) start = s.elapsed_ms;
-    } else if (start !== null) {
-      bands.push([start, s.elapsed_ms]);
-      start = null;
-    }
-  }
-  if (start !== null && samples.length > 0) {
-    bands.push([start, samples[samples.length - 1].elapsed_ms]);
-  }
-  return bands;
 }

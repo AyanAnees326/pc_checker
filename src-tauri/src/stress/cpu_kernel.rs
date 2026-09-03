@@ -11,6 +11,14 @@
 //! error, not an inferred one from temperature or clock behaviour. This is the same
 //! principle production stress tools (Prime95, y-cruncher) use — check the answer,
 //! don't just generate heat.
+//!
+//! A register-resident FMA chain never touches memory, so on its own it leaves the
+//! cache hierarchy and memory controller — a real fraction of package power and a real
+//! source of instability on marginal RAM/IMC configurations — completely unloaded.
+//! Each block therefore also streams through a per-thread buffer well larger than any
+//! consumer CPU's per-core L2, forcing real L3/DRAM traffic every checkpoint. It is
+//! folded into the same checksum comparison as the register chain, so a fault in
+//! either component — ALU/FPU or cache/memory — fails the same single self-check.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -30,6 +38,19 @@ const CHECKPOINT_ITERS: u32 = 200_000;
 /// would make every block "fail" for a reason that has nothing to do with the CPU.
 const SEQ_A: f64 = 0.999_999_1;
 const SEQ_B: f64 = 1.000_000_3;
+
+/// Per-thread element count for the memory-bandwidth component. 1M `f64` = 8 MiB —
+/// comfortably larger than any consumer CPU's per-core L2 (typically 256KB-2MB) and a
+/// meaningful fraction of a shared L3, so a full traverse forces real L3/DRAM traffic
+/// rather than just bouncing around in cache. With N worker threads each doing this,
+/// the aggregate is a genuine, sustained memory-subsystem load.
+const MEM_ELEMENTS: usize = 1 << 20;
+
+/// Read-modify-write passes over the buffer per checkpoint. Chosen so the memory
+/// component's cost sits well below the register FMA chain's (~2-5ms vs. tens of ms at
+/// realistic bandwidths) — enough added traffic to matter, not so much that a single
+/// checkpoint's latency threatens fault-detection or cancellation responsiveness.
+const MEM_PASSES: u32 = 4;
 
 /// Shared, lock-free counters the orchestrator's sampler reads from any thread.
 #[derive(Default)]
@@ -64,16 +85,38 @@ pub fn run_worker(
 
     let seed = logical_processor as f64 + 1.0;
     let has_fma = is_x86_feature_detected!("fma") && is_x86_feature_detected!("avx2");
-    let reference = checkpoint_checksum(seed, has_fma);
+    // Allocated once, not per checkpoint: `memory_pass_checksum` resets its contents to
+    // a deterministic pattern on every call, so reuse costs nothing in determinism and
+    // saves a repeated 8 MiB allocation on every single checkpoint.
+    let mut mem_buf = vec![0.0f64; MEM_ELEMENTS];
+    let reference = checkpoint_checksum(seed, has_fma) ^ memory_pass_checksum(&mut mem_buf, seed);
 
     while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
-        let current = checkpoint_checksum(seed, has_fma);
+        let current = checkpoint_checksum(seed, has_fma) ^ memory_pass_checksum(&mut mem_buf, seed);
         stats.iterations.fetch_add(CHECKPOINT_ITERS as u64, Ordering::Relaxed);
 
         if current != reference {
             stats.fault.store(true, Ordering::Relaxed);
         }
     }
+}
+
+/// Deterministic memory-bandwidth pass: reset the buffer to a fixed pattern derived
+/// from `seed`, then stream the same `v = v*a + b` recurrence used by the register
+/// chain through it [`MEM_PASSES`] times, read-modify-write. Resetting on every call
+/// (rather than letting state evolve across checkpoints) is what keeps this comparable
+/// bit-for-bit against a single fixed reference the same way the register chain is —
+/// each call is a fully independent, reproducible unit of work.
+fn memory_pass_checksum(buf: &mut [f64], seed: f64) -> u64 {
+    for (i, x) in buf.iter_mut().enumerate() {
+        *x = seed + i as f64 * 1e-3;
+    }
+    for _ in 0..MEM_PASSES {
+        for x in buf.iter_mut() {
+            *x = x.mul_add(SEQ_A, SEQ_B);
+        }
+    }
+    buf.iter().fold(0u64, |acc, x| acc ^ x.to_bits())
 }
 
 fn pin_to_core(logical_processor: u32) {
